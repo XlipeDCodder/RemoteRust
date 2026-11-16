@@ -1,10 +1,9 @@
 //! Reading and writing the configuration file.
 
-use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{self, Read as _, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::files::{read_limited, write_atomic};
 use crate::{Config, ConfigError};
 
 /// File name of the per-user configuration.
@@ -32,25 +31,17 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// [`ConfigError::Io`] if the file cannot be read (including when it does
 /// not exist), [`ConfigError::TooLarge`], or any parse/validation error.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let io_err = |source: io::Error| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-
-    let file = File::open(path).map_err(io_err)?;
-    let mut text = String::new();
-    // Read at most one byte past the limit: enough to detect an oversized
-    // file without trusting metadata or allocating unbounded memory.
-    file.take(MAX_CONFIG_FILE_SIZE.saturating_add(1))
-        .read_to_string(&mut text)
-        .map_err(io_err)?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_CONFIG_FILE_SIZE {
-        return Err(ConfigError::TooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_CONFIG_FILE_SIZE,
-        });
-    }
+    let text = read_text(path, MAX_CONFIG_FILE_SIZE)?;
     Config::from_toml_str(&text)
+}
+
+/// Reads a UTF-8 text file of at most `limit` bytes.
+pub(crate) fn read_text(path: &Path, limit: u64) -> Result<String, ConfigError> {
+    let bytes = read_limited(path, limit)?;
+    String::from_utf8(bytes).map_err(|err| ConfigError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, err),
+    })
 }
 
 /// Like [`load`], but returns the defaults when the file does not exist yet.
@@ -59,9 +50,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 /// Same as [`load`], except for a missing file.
 pub fn load_or_default(path: &Path) -> Result<Config, ConfigError> {
     match load(path) {
-        Err(ConfigError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            Ok(Config::default())
-        }
+        Err(err) if err.is_not_found() => Ok(Config::default()),
         other => other,
     }
 }
@@ -76,39 +65,13 @@ pub fn load_or_default(path: &Path) -> Result<Config, ConfigError> {
 /// [`ConfigError::Invalid`] (nothing is written) or [`ConfigError::Io`].
 pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let text = config.to_toml_string()?;
-    let io_err = |source: io::Error| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(io_err)?;
-    }
-    let tmp = temporary_path(path);
-    let result = write_and_sync(&tmp, text.as_bytes()).and_then(|()| fs::rename(&tmp, path));
-    if result.is_err() {
-        // Best effort: the original error is the one worth reporting.
-        let _ = fs::remove_file(&tmp);
-    }
-    result.map_err(io_err)
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map_or_else(|| OsString::from(CONFIG_FILE_NAME), OsString::from);
-    name.push(format!(".tmp-{}", std::process::id()));
-    path.with_file_name(name)
-}
-
-fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    write_atomic(path, text.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::AgentConfig;
 

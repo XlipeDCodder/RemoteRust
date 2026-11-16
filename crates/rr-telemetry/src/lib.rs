@@ -8,6 +8,8 @@
 //! SPAKE2/OPAQUE messages) must never be logged, at any level.
 #![forbid(unsafe_code)]
 
+use std::io::IsTerminal as _;
+
 use tracing_subscriber::EnvFilter;
 
 /// Environment variable holding the log filter.
@@ -42,6 +44,7 @@ pub fn init() -> Result<(), TelemetryError> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .try_init()
         .map_err(|_| TelemetryError::AlreadyInitialized)?;
 

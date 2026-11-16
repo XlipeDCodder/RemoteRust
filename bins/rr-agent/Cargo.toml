@@ -8,8 +8,13 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 rr-config.workspace = true
+rr-net.workspace = true
+rr-platform.workspace = true
+rr-proto.workspace = true
 rr-telemetry.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [lints]

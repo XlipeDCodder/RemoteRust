@@ -5,7 +5,7 @@ use std::path::PathBuf;
 /// Errors produced while loading, validating or saving the configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The configuration file could not be read or written.
+    /// A file could not be read or written.
     #[error("I/O error on {}", .path.display())]
     Io {
         /// File involved in the failed operation.
@@ -15,7 +15,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    /// The file is larger than [`crate::MAX_CONFIG_FILE_SIZE`].
+    /// The file is larger than its size limit.
     #[error("{} is larger than the {limit}-byte limit", .path.display())]
     TooLarge {
         /// Offending file.
@@ -41,4 +41,12 @@ pub enum ConfigError {
         /// Human-readable explanation.
         reason: String,
     },
+}
+
+impl ConfigError {
+    /// True if the error means "the file does not exist".
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+    }
 }

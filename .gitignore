@@ -1,8 +1,13 @@
 /target
 **/*.rs.bk
 
-# cargo-fuzz output (fuzz targets arrive in M1)
+# cargo-fuzz output
 /fuzz/target
+/fuzz/Cargo.lock
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
+
+# Local-only docs (not published)
+/README.md
+/remote_desktop_app_architecture_security_blueprint*.md

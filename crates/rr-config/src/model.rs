@@ -2,15 +2,27 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::IpAddr;
 use std::ops::RangeInclusive;
 
+use ipnet::IpNet;
+pub use rr_proto::NetworkClass;
 use serde::{Deserialize, Serialize};
 
 use crate::ConfigError;
 
 /// Maximum length of a device name, in bytes. Matches the protocol limit for
 /// names sent to peers.
-pub const MAX_DEVICE_NAME_LEN: usize = 64;
+pub const MAX_DEVICE_NAME_LEN: usize = rr_proto::MAX_DEVICE_NAME;
+
+/// Maximum number of entries in one `allowed_sources` list.
+pub const MAX_ALLOWED_SOURCES: usize = 64;
+
+/// Maximum number of entries in [`AgentConfig::manual_listen`].
+pub const MAX_MANUAL_LISTEN: usize = 16;
+
+/// Name used when neither the configuration nor the OS provides one.
+const FALLBACK_DEVICE_NAME: &str = "unnamed";
 
 /// Upper bound for [`ViewerConfig::race_stagger_ms`].
 const MAX_RACE_STAGGER_MS: u16 = 2_000;
@@ -58,10 +70,21 @@ impl Config {
     /// [`ConfigError::Invalid`] naming the first offending key.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(name) = &self.device_name {
-            validate_device_name(name)?;
+            validate_name("device_name", name)?;
         }
         self.agent.validate()?;
         self.viewer.validate()
+    }
+
+    /// Name to present to peers: the configured one, else the OS hostname
+    /// passed in by the caller, else a fixed fallback. Always valid.
+    #[must_use]
+    pub fn effective_device_name(&self, hostname: Option<&str>) -> String {
+        match (&self.device_name, hostname) {
+            (Some(name), _) => name.clone(),
+            (None, Some(host)) => sanitize_device_name(host),
+            (None, None) => FALLBACK_DEVICE_NAME.to_owned(),
+        }
     }
 }
 
@@ -71,6 +94,9 @@ impl Config {
 pub struct AgentConfig {
     /// UDP port of the QUIC listeners.
     pub listen_port: u16,
+    /// Local addresses to listen on for the `manual` network class.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub manual_listen: Vec<IpAddr>,
     /// Listening and access policy per network class.
     pub networks: NetworkPolicies,
     /// Attended-session parameters.
@@ -86,15 +112,41 @@ impl AgentConfig {
             return Err(invalid("agent.listen_port", "must be between 1 and 65535"));
         }
         for class in NetworkClass::ALL {
-            let policy = self.networks.get(class);
-            if (policy.attended || policy.unattended) && !policy.listen {
+            self.networks.get(class).validate(class)?;
+        }
+        self.validate_manual_listen()?;
+        self.attended.validate()
+    }
+
+    fn validate_manual_listen(&self) -> Result<(), ConfigError> {
+        const FIELD: &str = "agent.manual_listen";
+        if self.networks.manual.listen && self.manual_listen.is_empty() {
+            return Err(invalid(
+                FIELD,
+                "`networks.manual.listen = true` needs at least one address here",
+            ));
+        }
+        if self.manual_listen.len() > MAX_MANUAL_LISTEN {
+            return Err(invalid(
+                FIELD,
+                format!("at most {MAX_MANUAL_LISTEN} addresses are allowed"),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for addr in &self.manual_listen {
+            // Wildcard binds would expose the Agent on every interface,
+            // defeating per-network policy (blueprint v2 §5.3).
+            if addr.is_unspecified() || addr.is_multicast() {
                 return Err(invalid(
-                    "agent.networks",
-                    format!("`{class}` accepts sessions but has `listen = false`"),
+                    FIELD,
+                    format!("`{addr}` is not a unicast interface address"),
                 ));
             }
+            if !seen.insert(*addr) {
+                return Err(invalid(FIELD, format!("`{addr}` is listed more than once")));
+            }
         }
-        self.attended.validate()
+        Ok(())
     }
 }
 
@@ -102,62 +154,18 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             listen_port: Self::DEFAULT_PORT,
+            manual_listen: Vec::new(),
             networks: NetworkPolicies::default(),
             attended: AttendedConfig::default(),
         }
     }
 }
 
-/// Network classes RustRemote can detect (blueprint v2 §5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkClass {
-    /// Tailscale (WireGuard).
-    Tailscale,
-    /// Radmin VPN (Windows only).
-    Radmin,
-    /// FortiClient SSL-VPN, or a corporate LAN reached through it.
-    FortiClient,
-    /// Physical LAN interfaces. Disabled by default.
-    Lan,
-    /// Interfaces or addresses chosen manually by the user.
-    Manual,
-}
-
-impl NetworkClass {
-    /// Every class, in the default Viewer priority order.
-    pub const ALL: [Self; 5] = [
-        Self::Tailscale,
-        Self::Radmin,
-        Self::FortiClient,
-        Self::Lan,
-        Self::Manual,
-    ];
-
-    /// Name used in the configuration file.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tailscale => "tailscale",
-            Self::Radmin => "radmin",
-            Self::FortiClient => "forticlient",
-            Self::Lan => "lan",
-            Self::Manual => "manual",
-        }
-    }
-}
-
-impl fmt::Display for NetworkClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// What the Agent allows on one network class.
 ///
-/// All three keys are required when a class table is present: for a security
-/// policy, explicit beats implicit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `listen`, `attended` and `unattended` are required when a class table is
+/// present: for a security policy, explicit beats implicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     /// Open QUIC listeners on interfaces of this class.
@@ -166,6 +174,11 @@ pub struct NetworkPolicy {
     pub attended: bool,
     /// Accept unattended sessions arriving through this class.
     pub unattended: bool,
+    /// Source networks allowed to connect. Packets from anywhere else are
+    /// dropped before any TLS work. Empty means automatic: the VPN's own
+    /// range for Tailscale, otherwise the subnets of the listening interface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sources: Vec<IpNet>,
 }
 
 impl NetworkPolicy {
@@ -174,6 +187,7 @@ impl NetworkPolicy {
         listen: true,
         attended: true,
         unattended: false,
+        allowed_sources: Vec::new(),
     };
 
     /// Not listening at all. Default for LAN and manual entries.
@@ -181,12 +195,43 @@ impl NetworkPolicy {
         listen: false,
         attended: false,
         unattended: false,
+        allowed_sources: Vec::new(),
     };
+
+    fn validate(&self, class: NetworkClass) -> Result<(), ConfigError> {
+        const FIELD: &str = "agent.networks";
+        if (self.attended || self.unattended) && !self.listen {
+            return Err(invalid(
+                FIELD,
+                format!("`{class}` accepts sessions but has `listen = false`"),
+            ));
+        }
+        if self.allowed_sources.len() > MAX_ALLOWED_SOURCES {
+            return Err(invalid(
+                FIELD,
+                format!("`{class}.allowed_sources` has more than {MAX_ALLOWED_SOURCES} entries"),
+            ));
+        }
+        for net in &self.allowed_sources {
+            // `10.0.0.5/8` is almost always a typo for a host or for
+            // `10.0.0.0/8`; refusing it avoids silently widening access.
+            if net.trunc() != *net {
+                return Err(invalid(
+                    FIELD,
+                    format!(
+                        "`{class}.allowed_sources`: `{net}` has host bits set (did you mean `{}`?)",
+                        net.trunc()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Policy per network class. Defaults follow blueprint v2 §5.3: unattended
 /// access is off everywhere until the user enables it explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkPolicies {
     /// Tailscale policy.
@@ -204,13 +249,13 @@ pub struct NetworkPolicies {
 impl NetworkPolicies {
     /// Policy for `class`.
     #[must_use]
-    pub const fn get(&self, class: NetworkClass) -> NetworkPolicy {
+    pub const fn get(&self, class: NetworkClass) -> &NetworkPolicy {
         match class {
-            NetworkClass::Tailscale => self.tailscale,
-            NetworkClass::Radmin => self.radmin,
-            NetworkClass::FortiClient => self.forticlient,
-            NetworkClass::Lan => self.lan,
-            NetworkClass::Manual => self.manual,
+            NetworkClass::Tailscale => &self.tailscale,
+            NetworkClass::Radmin => &self.radmin,
+            NetworkClass::FortiClient => &self.forticlient,
+            NetworkClass::Lan => &self.lan,
+            NetworkClass::Manual => &self.manual,
         }
     }
 }
@@ -231,6 +276,9 @@ impl Default for NetworkPolicies {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttendedConfig {
+    /// Accept pairing requests from unknown devices. When `false`, unknown
+    /// keys are rejected during the TLS handshake.
+    pub pairing_enabled: bool,
     /// Seconds before an unanswered consent prompt is denied.
     pub consent_timeout_secs: u16,
     /// Seconds a session code stays valid.
@@ -264,6 +312,7 @@ impl AttendedConfig {
 impl Default for AttendedConfig {
     fn default() -> Self {
         Self {
+            pairing_enabled: true,
             consent_timeout_secs: 30,
             code_ttl_secs: 300,
             max_code_attempts: 3,
@@ -314,22 +363,56 @@ impl Default for ViewerConfig {
     }
 }
 
-fn validate_device_name(name: &str) -> Result<(), ConfigError> {
-    const FIELD: &str = "device_name";
+/// Characters never allowed in a device name: control characters, and
+/// bidirectional-text overrides that could make a consent prompt display
+/// something other than what was sent.
+fn is_forbidden_name_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Turns an untrusted name (a peer's `Hello`, an OS hostname) into one that
+/// passes validation: forbidden characters removed, whitespace trimmed,
+/// truncated to [`MAX_DEVICE_NAME_LEN`] bytes on a character boundary.
+#[must_use]
+pub fn sanitize_device_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_DEVICE_NAME_LEN));
+    for c in raw.trim().chars().filter(|&c| !is_forbidden_name_char(c)) {
+        if out.len().saturating_add(c.len_utf8()) > MAX_DEVICE_NAME_LEN {
+            break;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        FALLBACK_DEVICE_NAME.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Validates a device name stored in a file under `field`.
+pub(crate) fn validate_name(field: &'static str, name: &str) -> Result<(), ConfigError> {
     if name.trim().is_empty() {
-        return Err(invalid(FIELD, "must not be blank"));
+        return Err(invalid(field, "must not be blank"));
     }
     if name.trim() != name {
-        return Err(invalid(FIELD, "must not start or end with whitespace"));
+        return Err(invalid(field, "must not start or end with whitespace"));
     }
     if name.len() > MAX_DEVICE_NAME_LEN {
         return Err(invalid(
-            FIELD,
+            field,
             format!("must be at most {MAX_DEVICE_NAME_LEN} bytes"),
         ));
     }
-    if name.chars().any(char::is_control) {
-        return Err(invalid(FIELD, "must not contain control characters"));
+    if name.chars().any(is_forbidden_name_char) {
+        return Err(invalid(
+            field,
+            "must not contain control or text-direction characters",
+        ));
     }
     Ok(())
 }
@@ -356,7 +439,7 @@ where
     }
 }
 
-fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigError {
+pub(crate) fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigError {
     ConfigError::Invalid {
         field,
         reason: reason.into(),
@@ -392,6 +475,7 @@ mod tests {
     fn defaults_match_blueprint() {
         let config = Config::default();
         assert_eq!(config.agent.listen_port, 7878);
+        assert!(config.agent.attended.pairing_enabled);
         for class in [
             NetworkClass::Tailscale,
             NetworkClass::Radmin,
@@ -399,11 +483,11 @@ mod tests {
         ] {
             assert_eq!(
                 config.agent.networks.get(class),
-                NetworkPolicy::ATTENDED_ONLY
+                &NetworkPolicy::ATTENDED_ONLY
             );
         }
         for class in [NetworkClass::Lan, NetworkClass::Manual] {
-            assert_eq!(config.agent.networks.get(class), NetworkPolicy::DISABLED);
+            assert_eq!(config.agent.networks.get(class), &NetworkPolicy::DISABLED);
         }
         assert!(
             NetworkClass::ALL
@@ -467,6 +551,65 @@ mod tests {
     }
 
     #[test]
+    fn allowed_sources_parse_and_round_trip() {
+        let text = "[agent.networks.lan]\nlisten = true\nattended = true\nunattended = false\n\
+                    allowed_sources = [\"192.168.10.0/24\", \"fd00::/8\"]\n";
+        let config = Config::from_toml_str(text).unwrap();
+        assert_eq!(config.agent.networks.lan.allowed_sources.len(), 2);
+        let again = Config::from_toml_str(&config.to_toml_string().unwrap()).unwrap();
+        assert_eq!(again, config);
+    }
+
+    #[test]
+    fn allowed_sources_rules() {
+        // Not a network at all.
+        assert_parse_error(
+            "[agent.networks.lan]\nlisten = true\nattended = true\nunattended = false\n\
+             allowed_sources = [\"192.168.10.5\"]\n",
+        );
+        // Host bits set.
+        assert_invalid(
+            "[agent.networks.lan]\nlisten = true\nattended = true\nunattended = false\n\
+             allowed_sources = [\"10.1.2.3/8\"]\n",
+            "agent.networks",
+        );
+        // Too many entries.
+        let many: Vec<String> = (0..=MAX_ALLOWED_SOURCES)
+            .map(|i| format!("\"10.{i}.0.0/16\""))
+            .collect();
+        assert_invalid(
+            &format!(
+                "[agent.networks.lan]\nlisten = true\nattended = true\nunattended = false\n\
+                 allowed_sources = [{}]\n",
+                many.join(", ")
+            ),
+            "agent.networks",
+        );
+    }
+
+    #[test]
+    fn manual_listen_rules() {
+        let manual_on =
+            "[agent.networks.manual]\nlisten = true\nattended = true\nunattended = false\n";
+        assert_invalid(manual_on, "agent.manual_listen");
+
+        let ok = format!("[agent]\nmanual_listen = [\"10.8.0.2\"]\n{manual_on}");
+        let config = Config::from_toml_str(&ok).unwrap();
+        assert_eq!(config.agent.manual_listen.len(), 1);
+
+        for bad in ["0.0.0.0", "::", "224.0.0.1"] {
+            assert_invalid(
+                &format!("[agent]\nmanual_listen = [\"{bad}\"]\n"),
+                "agent.manual_listen",
+            );
+        }
+        assert_invalid(
+            "[agent]\nmanual_listen = [\"10.8.0.2\", \"10.8.0.2\"]\n",
+            "agent.manual_listen",
+        );
+    }
+
+    #[test]
     fn port_zero_is_rejected() {
         assert_invalid("[agent]\nlisten_port = 0\n", "agent.listen_port");
     }
@@ -514,6 +657,7 @@ mod tests {
             ..Config::default()
         };
         assert!(with_name("office-pc").validate().is_ok());
+        assert!(with_name("escritório").validate().is_ok());
         assert!(
             with_name(&"a".repeat(MAX_DEVICE_NAME_LEN))
                 .validate()
@@ -525,6 +669,7 @@ mod tests {
             "   ".to_owned(),
             " office-pc".to_owned(),
             "office\u{7}pc".to_owned(),
+            "office\u{202E}cp".to_owned(),
             "a".repeat(MAX_DEVICE_NAME_LEN + 1),
         ] {
             match with_name(&bad).validate() {
@@ -532,5 +677,43 @@ mod tests {
                 other => panic!("{bad:?} should be rejected, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn sanitized_names_always_validate() {
+        for raw in [
+            "",
+            "   ",
+            "  office-pc  ",
+            "evil\u{202E}fdp.exe",
+            "tab\there",
+            &"é".repeat(MAX_DEVICE_NAME_LEN),
+            &format!("{} x", "a".repeat(MAX_DEVICE_NAME_LEN - 1)),
+        ] {
+            let name = sanitize_device_name(raw);
+            assert!(
+                validate_name("device_name", &name).is_ok(),
+                "{raw:?} -> {name:?}"
+            );
+        }
+        assert_eq!(sanitize_device_name("  office-pc "), "office-pc");
+        assert_eq!(sanitize_device_name("\u{1}\u{2}"), FALLBACK_DEVICE_NAME);
+    }
+
+    #[test]
+    fn effective_name_precedence() {
+        let named = Config {
+            device_name: Some("desk".to_owned()),
+            ..Config::default()
+        };
+        assert_eq!(named.effective_device_name(Some("HOST")), "desk");
+        assert_eq!(
+            Config::default().effective_device_name(Some(" HOST ")),
+            "HOST"
+        );
+        assert_eq!(
+            Config::default().effective_device_name(None),
+            FALLBACK_DEVICE_NAME
+        );
     }
 }

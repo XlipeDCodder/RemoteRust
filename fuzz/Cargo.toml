@@ -1,0 +1,26 @@
+# Fuzz targets (cargo-fuzz + libFuzzer). Requires a nightly toolchain:
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run control_msg
+# Kept out of the main workspace: it needs nightly and sanitizer flags.
+[package]
+name = "rr-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rr-proto = { path = "../crates/rr-proto" }
+
+[[bin]]
+name = "control_msg"
+path = "fuzz_targets/control_msg.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace, so the root workspace never builds this crate.
+[workspace]

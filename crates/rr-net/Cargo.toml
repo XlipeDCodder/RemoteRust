@@ -7,6 +7,24 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+ipnet.workspace = true
+netdev.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+rr-config.workspace = true
+rr-platform.workspace = true
+rr-proto.workspace = true
+rustls.workspace = true
+spake2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+webpki.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

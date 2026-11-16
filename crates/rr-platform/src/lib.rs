@@ -6,11 +6,12 @@
 //!
 //! Planned platform traits: `ScreenCapturer`, `InputInjector`, `CursorSource`,
 //! `DesktopStateWatcher`, `KillSwitchHotkey`, `SessionIndicator`.
-//!
-//! Status: M0 skeleton. Capture starts in M2, input injection in M3.
 
 #[cfg(not(any(windows, target_os = "linux")))]
 compile_error!("RustRemote supports only Windows and Linux (blueprint v2 §2).");
+
+pub mod host;
+pub mod secret;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

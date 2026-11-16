@@ -1,12 +1,12 @@
 //! RustRemote networking (blueprint v2 §5, §6.1, §7.2–§7.5).
 //!
 //! Responsibilities:
+//! - device identity (Ed25519 key, self-signed certificate, fingerprint);
 //! - QUIC endpoints (`quinn`) with mutual TLS 1.3 and pinned device keys;
-//! - attended pairing (SPAKE2) and unattended login (OPAQUE), bound to TLS;
+//! - attended pairing (SPAKE2) and, later, unattended login (OPAQUE), both
+//!   bound to the TLS session;
 //! - interface discovery, VPN classification, per-interface listeners;
 //! - Viewer path selection (Happy-Eyeballs race across VPNs).
-//!
-//! Status: M0 skeleton. Implementation starts in M1.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
@@ -18,3 +18,24 @@
         clippy::arithmetic_side_effects
     )
 )]
+
+pub mod agent;
+mod channel;
+pub mod discovery;
+mod error;
+pub mod identity;
+pub mod listen;
+pub mod pairing;
+pub mod race;
+mod tls;
+pub mod viewer;
+
+pub use agent::{Agent, AgentOptions, SourceFilter};
+pub use discovery::{LocalInterface, discover};
+pub use error::SessionError;
+pub use identity::{DeviceIdentity, Fingerprint, IdentityError, default_identity_path};
+pub use listen::{ListenPlan, ListenTarget, ListenerSet, plan_listeners, run_listeners};
+pub use pairing::{CodePolicy, PairingCodes, SessionCode};
+pub use race::RaceError;
+pub use tls::ViewerAccess;
+pub use viewer::{Viewer, ViewerSession};
