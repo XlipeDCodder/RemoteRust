@@ -1,0 +1,15 @@
+[package]
+name = "rr-desktop-helper"
+description = "RustRemote privileged per-session helper: capture and input on the login screen and secure desktop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rr-telemetry.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

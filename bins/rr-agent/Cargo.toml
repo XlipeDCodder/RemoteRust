@@ -1,0 +1,16 @@
+[package]
+name = "rr-agent"
+description = "RustRemote Agent: runs on the machine being accessed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rr-config.workspace = true
+rr-telemetry.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

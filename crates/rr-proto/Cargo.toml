@@ -1,0 +1,12 @@
+[package]
+name = "rr-proto"
+description = "RustRemote wire protocol: messages, size limits and encoding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

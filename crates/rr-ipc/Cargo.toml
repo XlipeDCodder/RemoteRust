@@ -1,0 +1,12 @@
+[package]
+name = "rr-ipc"
+description = "RustRemote fixed-schema IPC between rr-agent and the privileged rr-desktop-helper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

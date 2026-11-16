@@ -1,0 +1,15 @@
+[package]
+name = "rr-service"
+description = "RustRemote privileged service (unattended mode only)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rr-telemetry.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
