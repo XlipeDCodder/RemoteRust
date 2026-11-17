@@ -100,6 +100,11 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
     let joined = tokio::task::spawn_blocking(move || thread.join()).await;
     match joined {
         Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(PipelineError::Capture(CaptureError::Denied)))) => {
+            println!("  Screen sharing was declined or stopped in the system dialog.");
+            tracing::info!(%viewer, "screen sharing declined in the system dialog");
+            handle.end(DisconnectReason::ConsentDenied);
+        }
         Ok(Ok(Err(err))) => {
             tracing::error!(error = %err, "screen capture failed");
             handle.end(DisconnectReason::MediaFailed);

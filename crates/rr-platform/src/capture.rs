@@ -4,8 +4,10 @@
 //! path). Capturers only produce an image when the screen changed, so a
 //! static screen costs no work downstream (§8.2).
 //!
-//! Backends: DXGI Desktop Duplication on Windows. X11 (MIT-SHM) and
-//! Wayland (portal + PipeWire) follow later in M2.
+//! Backends: DXGI Desktop Duplication on Windows; on Linux, X11 (MIT-SHM
+//! woken by XDamage) or, in Wayland sessions, the xdg-desktop-portal
+//! ScreenCast interface with PipeWire. `RUSTREMOTE_CAPTURE=x11|portal`
+//! overrides the Linux choice.
 
 use std::time::{Duration, Instant};
 
@@ -59,6 +61,10 @@ pub enum CaptureError {
     /// The requested monitor does not exist.
     #[error("monitor {0} not found")]
     NoSuchMonitor(u8),
+    /// The local user declined the system's screen-sharing dialog, let it
+    /// time out, or stopped sharing (Wayland portal).
+    #[error("the local user declined or stopped screen sharing")]
+    Denied,
     /// Capture was interrupted by a desktop switch, a display mode change
     /// or the secure desktop (UAC, lock screen). Calling `capture` again
     /// tries to recover.
@@ -105,11 +111,13 @@ pub fn monitors() -> Result<Vec<Monitor>, CaptureError> {
     {
         crate::win::capture::monitors()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        Err(CaptureError::Unsupported(
-            "Linux capture arrives later in M2",
-        ))
+        use crate::linux::{Backend, backend, portal, x11};
+        match backend()? {
+            Backend::X11 => x11::monitors(),
+            Backend::Portal => Ok(portal::monitors()),
+        }
     }
 }
 
@@ -123,12 +131,28 @@ pub fn open(id: u8) -> Result<Box<dyn ScreenCapturer>, CaptureError> {
     {
         Ok(Box::new(crate::win::capture::DxgiCapturer::open(id)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = id;
-        Err(CaptureError::Unsupported(
-            "Linux capture arrives later in M2",
-        ))
+        use crate::linux::{Backend, backend, portal, x11};
+        match backend()? {
+            Backend::X11 => Ok(Box::new(x11::X11Capturer::open(id)?)),
+            Backend::Portal => Ok(Box::new(portal::PortalCapturer::open(id)?)),
+        }
+    }
+}
+
+/// Whether [`open`] asks the local user to pick the screen in a system
+/// dialog (Wayland portal). [`monitors`] then lists a single placeholder
+/// of unknown size (0 × 0), and the real size comes with the frames.
+#[must_use]
+pub fn picks_in_dialog() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(crate::linux::backend(), Ok(crate::linux::Backend::Portal))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 

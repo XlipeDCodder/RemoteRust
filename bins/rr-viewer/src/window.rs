@@ -122,7 +122,10 @@ pub fn run(
         .monitors
         .iter()
         .find(|monitor| monitor.id == grant.monitor)
-        .map(|monitor| (u32::from(monitor.width), u32::from(monitor.height)));
+        .map(|monitor| (u32::from(monitor.width), u32::from(monitor.height)))
+        // 0 × 0: the size is unknown until the first frame (the Agent's
+        // user picks the screen in a system dialog).
+        .filter(|&(width, height)| width > 0 && height > 0);
     let mut app = App {
         title: format!("{} - RustRemote (view only)", session.agent_name()),
         options,
@@ -203,7 +206,11 @@ impl App<'_> {
                     .nth(index)
                     .with_context(|| format!("there is no local display {index}"))?,
             ),
-            None => event_loop.primary_monitor(),
+            // Wayland has no primary monitor: size the window for the
+            // first one (the compositor places it anyway).
+            None => event_loop
+                .primary_monitor()
+                .or_else(|| event_loop.available_monitors().next()),
         };
         let mut attributes = Window::default_attributes().with_title(self.title.clone());
         if let Some(monitor) = &monitor {
@@ -385,6 +392,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(failure) = self.renderer.as_ref().and_then(Renderer::take_failure) {
+            self.finish(event_loop, Outcome::Failed(failure));
+            return;
+        }
         let now = Instant::now();
         if now >= self.next_tick {
             self.overlay.tick(

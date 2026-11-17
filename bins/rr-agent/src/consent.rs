@@ -89,6 +89,9 @@ async fn accept(request: SessionRequest) {
     match request.accept(grant).await {
         Ok(session) => {
             println!("  Accepted: sharing this screen (Ctrl+C stops the Agent).");
+            if capture::picks_in_dialog() {
+                println!("  Pick the screen to share in the system dialog.");
+            }
             tokio::spawn(media::run_session(session, monitor));
         }
         Err(err) => println!("  Could not start the session: {err}"),

@@ -267,10 +267,14 @@ fn connect(
         } else {
             " "
         };
-        println!(
-            "  {marker} monitor {}: {} {}x{}",
-            monitor.id, monitor.name, monitor.width, monitor.height
-        );
+        if monitor.width == 0 || monitor.height == 0 {
+            println!("  {marker} monitor {}: {}", monitor.id, monitor.name);
+        } else {
+            println!(
+                "  {marker} monitor {}: {} {}x{}",
+                monitor.id, monitor.name, monitor.width, monitor.height
+            );
+        }
     }
     println!("Press F1 in the window for statistics, F11 for full screen.");
 

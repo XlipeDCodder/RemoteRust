@@ -4,7 +4,7 @@
 //! shader converts it to RGB while drawing it letterboxed into the window.
 //! The egui overlay is drawn on top, in the same render pass.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
 use rr_media::I420;
@@ -21,6 +21,7 @@ pub struct Renderer {
     instance: wgpu::Instance,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -33,6 +34,8 @@ pub struct Renderer {
     egui: egui_wgpu::Renderer,
     description: String,
     warned_too_large: bool,
+    /// The first graphics error that made drawing impossible.
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 /// GPU copies of the current picture.
@@ -48,7 +51,7 @@ impl Renderer {
         let surface = instance
             .create_surface(Arc::clone(&window))
             .context("cannot create a drawing surface for the window")?;
-        let adapter = match native_adapter(&instance, &surface).await {
+        let adapter = match pick_adapter(&instance, &surface).await {
             Some(adapter) => adapter,
             None => instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
@@ -68,6 +71,18 @@ impl Renderer {
             })
             .await
             .context("cannot open the graphics device")?;
+        // wgpu's default treats any error it is not asked about as fatal
+        // (a panic, so an abort in release builds). Record it instead: the
+        // window then ends the session with the message.
+        let failure = Arc::new(Mutex::new(None));
+        let recorded = Arc::clone(&failure);
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            tracing::error!(%error, "graphics error");
+            recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert_with(|| format!("graphics error: {error}"));
+        }));
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -175,10 +190,11 @@ impl Renderer {
         let egui =
             egui_wgpu::Renderer::new(&device, view_format, egui_wgpu::RendererOptions::default());
 
-        let renderer = Self {
+        let mut renderer = Self {
             instance,
             window,
             surface,
+            adapter,
             device,
             queue,
             description: format!("{} ({:?}, {present_mode:?})", info.name, info.backend),
@@ -190,6 +206,7 @@ impl Renderer {
             planes: None,
             egui,
             warned_too_large: false,
+            failure,
         };
         renderer.configure();
         Ok(renderer)
@@ -205,10 +222,49 @@ impl Renderer {
         usize::try_from(self.device.limits().max_texture_dimension_2d).unwrap_or(usize::MAX)
     }
 
-    fn configure(&self) {
-        if self.config.width > 0 && self.config.height > 0 {
-            self.surface.configure(&self.device, &self.config);
+    /// The graphics failure that stopped drawing, once.
+    pub fn take_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    fn fail(&self, message: String) {
+        tracing::error!(%message, "drawing stopped");
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(message);
+    }
+
+    /// Configures the surface for the current size. A surface that refuses
+    /// (some drivers report it lost on resize) is recreated once; if that
+    /// fails too, the failure is recorded for [`Self::take_failure`].
+    fn configure(&mut self) {
+        if self.config.width == 0 || self.config.height == 0 {
+            return;
         }
+        let Some(error) = self.try_configure() else {
+            return;
+        };
+        tracing::warn!(%error, "the window surface failed; recreating it");
+        match self.instance.create_surface(Arc::clone(&self.window)) {
+            Ok(surface) if self.adapter.is_surface_supported(&surface) => {
+                self.surface = surface;
+                if let Some(error) = self.try_configure() {
+                    self.fail(format!("the window surface cannot be used: {error}"));
+                }
+            }
+            Ok(_) => self.fail("the window surface no longer works with this adapter".to_owned()),
+            Err(err) => self.fail(format!("cannot recreate the window surface: {err}")),
+        }
+    }
+
+    fn try_configure(&self) -> Option<wgpu::Error> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        self.surface.configure(&self.device, &self.config);
+        pollster::block_on(scope.pop())
     }
 
     /// Follows the window size (in physical pixels). A minimized window has
@@ -374,7 +430,7 @@ impl Renderer {
                         self.surface = surface;
                         self.configure();
                     }
-                    Err(err) => tracing::warn!(error = %err, "cannot recreate the window surface"),
+                    Err(err) => self.fail(format!("cannot recreate the window surface: {err}")),
                 }
                 return false;
             }
@@ -445,37 +501,76 @@ impl Renderer {
     }
 }
 
-/// An adapter of the platform's own graphics API that can draw to
-/// `surface`: D3D12 on Windows (flip-model presentation, integrated with
-/// the compositor), Metal on macOS, Vulkan elsewhere. `WGPU_BACKEND`
-/// (e.g. `vulkan`, `gl`) overrides the choice, for diagnosis.
-///
-/// The work per frame is tiny, so an integrated GPU comes first: on laptops
-/// with two GPUs it usually drives the display, which avoids a copy between
-/// adapters. Software adapters come last.
-async fn native_adapter(
-    instance: &wgpu::Instance,
-    surface: &wgpu::Surface<'_>,
-) -> Option<wgpu::Adapter> {
-    let native = if cfg!(windows) {
+/// The platform's own graphics API: D3D12 on Windows (flip-model
+/// presentation, integrated with the compositor), Metal on macOS, Vulkan
+/// elsewhere.
+fn native_backends() -> wgpu::Backends {
+    if cfg!(windows) {
         wgpu::Backends::DX12
     } else if cfg!(target_os = "macos") {
         wgpu::Backends::METAL
     } else {
         wgpu::Backends::VULKAN
+    }
+}
+
+/// Preference among adapters that can draw to the window (lower is
+/// better): a real GPU before a software rasterizer, then the platform's
+/// own API, then an integrated GPU before a discrete one. The work per
+/// frame is tiny, and on laptops with two GPUs the integrated one usually
+/// drives the display, which avoids a copy between adapters.
+fn rank(device_type: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, u8, u8) {
+    let software = u8::from(device_type == wgpu::DeviceType::Cpu);
+    let foreign = u8::from(!native_backends().contains(backend.into()));
+    let kind = match device_type {
+        wgpu::DeviceType::IntegratedGpu => 0,
+        wgpu::DeviceType::DiscreteGpu => 1,
+        wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => 2,
+        wgpu::DeviceType::Cpu => 3,
     };
-    let backends = wgpu::Backends::from_env().unwrap_or(native);
+    (software, foreign, kind)
+}
+
+/// The best adapter on `backends` that can draw to `surface`.
+async fn best_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+    backends: wgpu::Backends,
+) -> Option<wgpu::Adapter> {
     instance
         .enumerate_adapters(backends)
         .await
         .into_iter()
         .filter(|adapter| adapter.is_surface_supported(surface))
-        .min_by_key(|adapter| match adapter.get_info().device_type {
-            wgpu::DeviceType::IntegratedGpu => 0,
-            wgpu::DeviceType::DiscreteGpu => 1,
-            wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => 2,
-            wgpu::DeviceType::Cpu => 3,
+        .min_by_key(|adapter| {
+            let info = adapter.get_info();
+            rank(info.device_type, info.backend)
         })
+}
+
+/// Picks the adapter by [`rank`]. Other APIs are only enumerated when the
+/// platform's own has no hardware adapter (e.g. Vulkan with only a
+/// software driver, where OpenGL may still reach the GPU). `WGPU_BACKEND`
+/// (e.g. `vulkan`, `gl`) restricts the choice, for diagnosis.
+async fn pick_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Option<wgpu::Adapter> {
+    if let Some(backends) = wgpu::Backends::from_env() {
+        return best_adapter(instance, surface, backends).await;
+    }
+    let native = best_adapter(instance, surface, native_backends()).await;
+    let hardware =
+        |adapter: &wgpu::Adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu;
+    if native.as_ref().is_some_and(hardware) {
+        return native;
+    }
+    let other = best_adapter(instance, surface, wgpu::Backends::all() - native_backends()).await;
+    match (native, other) {
+        (_, Some(other)) if hardware(&other) => Some(other),
+        (Some(native), _) => Some(native),
+        (None, other) => other,
+    }
 }
 
 /// The largest rectangle with the picture's aspect ratio that fits the
@@ -494,7 +589,24 @@ fn letterbox(window: (u32, u32), picture: (u32, u32)) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::letterbox;
+    use super::{letterbox, rank};
+
+    #[test]
+    fn hardware_beats_software_on_any_api() {
+        use wgpu::{Backend, DeviceType};
+        let native = if cfg!(windows) {
+            Backend::Dx12
+        } else {
+            Backend::Vulkan
+        };
+        let software_native = rank(DeviceType::Cpu, native);
+        assert!(rank(DeviceType::IntegratedGpu, Backend::Gl) < software_native);
+        assert!(
+            rank(DeviceType::DiscreteGpu, native) < rank(DeviceType::IntegratedGpu, Backend::Gl)
+        );
+        assert!(rank(DeviceType::IntegratedGpu, native) < rank(DeviceType::DiscreteGpu, native));
+        assert!(software_native < rank(DeviceType::Cpu, Backend::Gl));
+    }
 
     #[test]
     fn letterbox_keeps_the_aspect_ratio() {

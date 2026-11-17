@@ -13,5 +13,12 @@ zeroize.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+pipewire.workspace = true
+rustix.workspace = true
+tokio.workspace = true
+x11rb.workspace = true
+
 [lints]
 workspace = true

@@ -21,6 +21,9 @@ rr-telemetry = { path = "crates/rr-telemetry" }
 
 # External crates (blueprint v2 §9). Keep this list short: every entry is attack surface.
 anyhow = "1"
+# Wayland screen capture (Linux): the xdg-desktop-portal ScreenCast client
+# (zbus on tokio), frames over PipeWire (blueprint v2 §3).
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "screencast"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 # Viewer UI (blueprint v2 §8.6). Default features off: no clipboard access and
@@ -32,6 +35,9 @@ ipnet = { version = "2", features = ["serde"] }
 netdev = { version = "0.47", default-features = false }
 # Software H.264 (BSD-2-Clause), built from source: the fallback codec (§8.4).
 openh264 = "0.9"
+# PipeWire client for portal screen casts; links libpipewire-0.3 (MIT), so
+# Linux builds need its headers, pkg-config and libclang.
+pipewire = "0.10"
 pollster = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 proptest = "1"
@@ -40,6 +46,8 @@ proptest = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "zeroize"] }
 ring = "0.17"
+# Linux syscalls for X11 capture (memfd, mmap, poll), without libc FFI.
+rustix = { version = "1.1", features = ["event", "fs", "mm"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 spake2 = "0.4"
@@ -68,6 +76,9 @@ windows = { version = "0.62", features = [
 # (ab_glyph → ttf-parser, unmaintained: RUSTSEC-2026-0192). Windows and X11
 # are unaffected; on GNOME/Wayland the title bar is drawn without its text.
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
+# X11 screen capture (Linux): pure-Rust protocol client with the MIT-SHM,
+# DAMAGE, XFIXES and RandR extensions; no libxcb needed.
+x11rb = { version = "0.13", features = ["damage", "randr", "shm", "xfixes"] }
 zeroize = "1"
 
 [workspace.lints.rust]
