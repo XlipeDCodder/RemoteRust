@@ -12,7 +12,9 @@ use rr_proto::{DevicePublicKey, DisconnectReason, MonitorInfo, Permissions};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::SessionError;
+use crate::cursor::CursorSender;
 use crate::identity::Fingerprint;
+use crate::input::InputReceiver;
 use crate::video::VideoSender;
 
 /// How long the local user has to answer the consent prompt before it is
@@ -132,6 +134,8 @@ pub(crate) enum Command {
 pub struct AgentSession {
     /// Where encoded frames go.
     pub video: VideoSender,
+    pub(crate) cursor: Option<CursorSender>,
+    pub(crate) input: Option<InputReceiver>,
     pub(crate) events: mpsc::Receiver<SessionEvent>,
     pub(crate) handle: SessionHandle,
     pub(crate) permissions: Permissions,
@@ -142,6 +146,18 @@ impl AgentSession {
     /// The next Viewer event, or `None` once the session is over.
     pub async fn next_event(&mut self) -> Option<SessionEvent> {
         self.events.recv().await
+    }
+
+    /// The Viewer's keyboard and mouse: `Some` (once) when `CONTROL` was
+    /// granted. Its first `recv` waits until the Viewer opens the stream.
+    pub fn take_input(&mut self) -> Option<InputReceiver> {
+        self.input.take()
+    }
+
+    /// Where pointer updates go: `Some` once, so a separate task can own
+    /// it. The stream opens with the first update.
+    pub fn take_cursor(&mut self) -> Option<CursorSender> {
+        self.cursor.take()
     }
 
     /// A handle that can end the session or update it from elsewhere.

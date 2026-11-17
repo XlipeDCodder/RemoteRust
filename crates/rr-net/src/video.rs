@@ -1,10 +1,12 @@
 //! The video stream: one ordered, unidirectional QUIC stream from the
-//! Agent (blueprint v2 §6.2, §6.3). Framing lives in [`rr_proto::video`].
+//! Agent (blueprint v2 §6.2, §6.3), tagged [`rr_proto::StreamKind::Video`].
+//! Framing lives in [`rr_proto::video`].
 
 use rr_proto::frame::PREFIX_LEN;
 use rr_proto::{VideoFrameHeader, limits, video};
 
 use crate::SessionError;
+use crate::streams::Pending;
 
 /// Writes encoded frames on the Agent side.
 #[derive(Debug)]
@@ -14,6 +16,7 @@ pub struct VideoSender {
 }
 
 impl VideoSender {
+    /// `stream` must already carry its tag.
     pub(crate) const fn new(stream: quinn::SendStream) -> Self {
         Self { stream, next_id: 0 }
     }
@@ -53,29 +56,15 @@ impl VideoSender {
 /// Reads encoded frames on the Viewer side.
 #[derive(Debug)]
 pub struct VideoReceiver {
-    conn: quinn::Connection,
-    /// Accepted on the first `recv`: QUIC announces a stream to the peer
-    /// only when its first bytes are sent.
-    stream: Option<quinn::RecvStream>,
+    /// Handed over when it arrives: QUIC announces a stream to the peer only
+    /// when its first bytes are sent.
+    stream: Pending,
     next_id: u64,
 }
 
 impl VideoReceiver {
-    pub(crate) const fn new(conn: quinn::Connection) -> Self {
-        Self {
-            conn,
-            stream: None,
-            next_id: 0,
-        }
-    }
-
-    async fn stream(&mut self) -> Result<&mut quinn::RecvStream, SessionError> {
-        if self.stream.is_none() {
-            self.stream = Some(self.conn.accept_uni().await?);
-        }
-        self.stream
-            .as_mut()
-            .ok_or(SessionError::Stream("video stream missing"))
+    pub(crate) const fn new(stream: Pending) -> Self {
+        Self { stream, next_id: 0 }
     }
 
     /// Receives the next frame into `bitstream` (resized; its capacity is
@@ -92,7 +81,7 @@ impl VideoReceiver {
         bitstream: &mut Vec<u8>,
     ) -> Result<VideoFrameHeader, SessionError> {
         let expected = self.next_id;
-        let stream = self.stream().await?;
+        let stream = self.stream.get().await?;
         let mut prefix = [0u8; PREFIX_LEN];
         stream.read_exact(&mut prefix).await?;
         let len = video::header_len(prefix)?;

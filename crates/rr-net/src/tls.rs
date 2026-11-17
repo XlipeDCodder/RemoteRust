@@ -288,10 +288,10 @@ struct StreamLimits {
     uni: u32,
 }
 
-/// The Viewer opens the control stream only (input arrives in M3).
-const VIEWER_OPENS: StreamLimits = StreamLimits { bidi: 1, uni: 0 };
-/// The Agent opens the video stream only (cursor arrives in M3).
-const AGENT_OPENS: StreamLimits = StreamLimits { bidi: 0, uni: 1 };
+/// The Viewer opens the control stream and the input stream.
+const VIEWER_OPENS: StreamLimits = StreamLimits { bidi: 1, uni: 1 };
+/// The Agent opens the video stream and the cursor stream.
+const AGENT_OPENS: StreamLimits = StreamLimits { bidi: 0, uni: 2 };
 
 /// QUIC transport parameters; `peer` limits what the other side may open.
 fn transport_config(peer: StreamLimits, send_window: Option<u64>) -> Arc<TransportConfig> {

@@ -169,6 +169,16 @@ impl DxgiCapturer {
                 os_error("DuplicateOutput", &err)
             }
         })?;
+        // The output may have moved or changed resolution (that is what
+        // usually loses the duplication): input mapping follows `monitor`.
+        // SAFETY: reads the output description into an owned struct.
+        if let Ok(desc) = unsafe { self.output.GetDesc() } {
+            let rect = desc.DesktopCoordinates;
+            self.monitor.left = rect.left;
+            self.monitor.top = rect.top;
+            self.monitor.width = rect.right.abs_diff(rect.left);
+            self.monitor.height = rect.bottom.abs_diff(rect.top);
+        }
         self.duplication = Some(duplication.clone());
         Ok(duplication)
     }

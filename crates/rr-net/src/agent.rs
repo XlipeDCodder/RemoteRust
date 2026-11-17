@@ -11,19 +11,22 @@ use quinn::VarInt;
 use rr_config::{KnownViewer, sanitize_device_name};
 use rr_proto::{
     BoundedString, BoundedVec, CandidateAddr, ControlMsg, DevicePublicKey, DisconnectReason,
-    Intent, MAX_DEVICE_NAME, Permissions,
+    Intent, MAX_DEVICE_NAME, Permissions, StreamKind,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::SessionError;
 use crate::channel::{ControlChannel, ControlWriter, disconnect_reason_for};
+use crate::cursor::CursorSender;
 use crate::identity::{DeviceIdentity, Fingerprint};
+use crate::input::InputReceiver;
 use crate::pairing::{self, PairingCodes, PairingKeys, PairingUnavailable};
 use crate::session::{
     AgentSession, Answer, CONSENT_TIMEOUT, Command, Grant, SessionEvent, SessionHandle,
     SessionRequest,
 };
+use crate::streams::{self, Pending as PendingStream};
 use crate::tls::{self, MAX_PENDING_HANDSHAKES, ViewerAccess};
 use crate::video::VideoSender;
 
@@ -384,6 +387,9 @@ enum State {
     Active {
         events: mpsc::Sender<SessionEvent>,
         commands: mpsc::Receiver<Command>,
+        /// Hands the Viewer's input stream to the media side: `Some` until
+        /// it arrives, and only when `CONTROL` was granted.
+        input: Option<oneshot::Sender<quinn::RecvStream>>,
     },
     /// The session ended; only pings and the goodbye remain.
     Done,
@@ -413,6 +419,11 @@ impl Control<'_> {
         loop {
             let step = tokio::select! {
                 msg = self.incoming.recv() => self.on_message(msg).await?,
+                stream = self.conn.accept_uni() => match stream {
+                    Ok(stream) => self.on_stream(stream).await?,
+                    // The connection is gone: the control stream says so too.
+                    Err(_) => Step::Stop(None),
+                },
                 pending = next_pending(&mut self.state) => match pending {
                     Pending::Answer(answer) => self.on_answer(answer).await?,
                     Pending::Command(command) => self.on_command(command).await?,
@@ -456,6 +467,24 @@ impl Control<'_> {
             }
             _ => return Err(SessionError::Protocol("unexpected control message")),
         }
+        Ok(Step::Continue)
+    }
+
+    /// A stream opened by the Viewer: only its input stream, once, in a
+    /// session that granted `CONTROL`.
+    async fn on_stream(&mut self, mut stream: quinn::RecvStream) -> Result<Step, SessionError> {
+        let kind = streams::read_tag(&mut stream).await?;
+        let State::Active { input, .. } = &mut self.state else {
+            return Err(SessionError::Protocol("stream opened outside a session"));
+        };
+        let slot = input
+            .take()
+            .filter(|_| kind == StreamKind::Input)
+            .ok_or(SessionError::Protocol("unexpected stream"))?;
+        tracing::debug!(viewer = %self.viewer.name, "input stream open");
+        // The media side may have stopped reading input: the stream is then
+        // dropped, which stops it.
+        let _ = slot.send(stream);
         Ok(Step::Continue)
     }
 
@@ -529,7 +558,8 @@ impl Control<'_> {
     }
 
     /// Sends `SessionStart` and the encoder name, then opens the video
-    /// stream.
+    /// stream. The cursor stream opens with its first update, the input
+    /// stream when the Viewer opens it.
     async fn start(
         &mut self,
         grant: &Grant,
@@ -549,11 +579,22 @@ impl Control<'_> {
                 name: BoundedString::truncating(&grant.encoder),
             })
             .await?;
-        let video = VideoSender::new(self.conn.open_uni().await?);
+        let video = VideoSender::new(streams::open(self.conn, StreamKind::Video).await?);
         let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (input_tx, input) = if permissions.contains(Permissions::CONTROL) {
+            let (tx, rx) = oneshot::channel();
+            (
+                Some(tx),
+                Some(InputReceiver::new(PendingStream::Waiting(rx))),
+            )
+        } else {
+            (None, None)
+        };
         let session = AgentSession {
             video,
+            cursor: Some(CursorSender::new(self.conn.clone())),
+            input,
             events: event_rx,
             handle: SessionHandle {
                 commands: command_tx,
@@ -564,6 +605,7 @@ impl Control<'_> {
         let state = State::Active {
             events: event_tx,
             commands: command_rx,
+            input: input_tx,
         };
         Ok((session, state))
     }

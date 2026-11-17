@@ -3,12 +3,15 @@
 //! Unprivileged process: network endpoint, protocol parsing, capture,
 //! encoding, input injection (attended mode), tray icon and consent dialog.
 //!
-//! M2 build: listeners, pairing, the consent prompt (in the terminal) and
-//! view-only screen sharing (software H.264). Input arrives in M3; the
-//! graphical consent dialog, indicator and kill switch in M4.
+//! M3 build: listeners, pairing, the consent prompt (in the terminal),
+//! screen sharing (software H.264), remote keyboard and mouse, and the
+//! pointer sent apart from the video. The graphical consent dialog,
+//! indicator and kill switch arrive in M4.
 #![forbid(unsafe_code)]
 
 mod consent;
+mod cursor;
+mod input;
 mod media;
 
 use std::path::PathBuf;
@@ -145,7 +148,7 @@ async fn run(paths: &Paths, mut config: Config, args: RunArgs) -> anyhow::Result
         None
     };
 
-    // Physical pixels for capture (and, in M3, input coordinates).
+    // Physical pixels for capture, input and pointer coordinates.
     if let Err(err) = rr_platform::capture::set_dpi_aware() {
         tracing::debug!(error = %err, "DPI awareness not changed");
     }

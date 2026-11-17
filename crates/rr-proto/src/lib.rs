@@ -23,7 +23,9 @@
 
 pub mod bounded;
 pub mod control;
+pub mod cursor;
 pub mod frame;
+pub mod input;
 mod key;
 mod network;
 pub mod session;
@@ -31,7 +33,9 @@ pub mod video;
 
 pub use bounded::{BoundedBytes, BoundedString, BoundedVec, TooLong};
 pub use control::{ControlMsg, DisconnectReason, Intent, MAX_ENCODER_NAME};
+pub use cursor::CursorMsg;
 pub use frame::FrameError;
+pub use input::{InputMsg, KeyCode, MouseButton};
 pub use key::{DevicePublicKey, KeyParseError};
 pub use network::{CandidateAddr, NetworkClass};
 pub use session::{MonitorInfo, Permissions};
@@ -53,4 +57,44 @@ pub mod limits {
     /// Maximum size of one encoded video frame (the bitstream after the
     /// header).
     pub const VIDEO_FRAME: u32 = 8 * 1024 * 1024;
+    /// Maximum encoded size of one input-stream message.
+    pub const INPUT: u32 = 64;
+    /// Maximum encoded size of one cursor-stream message: a 256 × 256 RGBA
+    /// shape plus its fields.
+    pub const CURSOR: u32 = 256 * 1024 + 64;
+}
+
+/// What a unidirectional stream carries: its first byte (blueprint v2
+/// §6.2). Each kind may be opened at most once per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamKind {
+    /// Agent → Viewer: encoded video frames.
+    Video,
+    /// Agent → Viewer: pointer position and shape.
+    Cursor,
+    /// Viewer → Agent: keyboard and mouse.
+    Input,
+}
+
+impl StreamKind {
+    /// The tag written as the stream's first byte.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Video => 0,
+            Self::Cursor => 1,
+            Self::Input => 2,
+        }
+    }
+
+    /// Parses a stream's first byte.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Video),
+            1 => Some(Self::Cursor),
+            2 => Some(Self::Input),
+            _ => None,
+        }
+    }
 }

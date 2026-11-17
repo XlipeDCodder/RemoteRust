@@ -1,5 +1,5 @@
-//! Screen-session tests over loopback: consent, `SessionStart`, the video
-//! stream and session end (blueprint v2 §6.5, §7.3).
+//! Screen-session tests over loopback: consent, `SessionStart`, the video,
+//! cursor and input streams, and session end (blueprint v2 §6.5, §7.3).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,8 +9,8 @@ use rr_net::{
     SessionEvent, SessionRequest, SourceFilter, Viewer, ViewerSession,
 };
 use rr_proto::{
-    AgentTimings, BoundedString, Codec, DevicePublicKey, DisconnectReason, MonitorInfo,
-    Permissions, VideoFrameHeader,
+    AgentTimings, BoundedBytes, BoundedString, Codec, CursorMsg, DevicePublicKey, DisconnectReason,
+    InputMsg, KeyCode, MonitorInfo, MouseButton, Permissions, VideoFrameHeader,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -110,16 +110,25 @@ fn header(frame_id: u64, len: usize) -> VideoFrameHeader {
     }
 }
 
-/// Starts a session that the test accepts with `granted`.
+/// Starts a view-only session that the test accepts with `granted`.
 async fn accepted(
     setup: &mut Setup,
     granted: Permissions,
 ) -> (rr_net::RemoteSession, AgentSession) {
+    requested(setup, Permissions::VIEW, granted).await
+}
+
+/// Starts a session asking for `asked`, accepted with `granted`.
+async fn requested(
+    setup: &mut Setup,
+    asked: Permissions,
+    granted: Permissions,
+) -> (rr_net::RemoteSession, AgentSession) {
     let session = setup.connect().await;
-    let viewer = tokio::spawn(session.start(Permissions::VIEW));
+    let viewer = tokio::spawn(session.start(asked));
     let request = setup.next_request().await;
     assert_eq!(request.viewer_name(), "test-viewer");
-    assert_eq!(request.permissions(), Permissions::VIEW);
+    assert_eq!(request.permissions(), asked);
     let agent_session = request.accept(grant(granted)).await.unwrap();
     let remote = timeout(WAIT, viewer).await.unwrap().unwrap().unwrap();
     (remote, agent_session)
@@ -279,4 +288,119 @@ async fn viewer_leaving_ends_the_agent_session() {
     remote.close().await;
     assert_eq!(timeout(WAIT, agent.next_event()).await.unwrap(), None);
     assert!(agent.handle().is_closed());
+}
+
+fn control() -> Permissions {
+    Permissions::VIEW.union(Permissions::CONTROL)
+}
+
+#[tokio::test]
+async fn input_reaches_the_agent_in_order() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    let (mut remote, mut agent) = requested(&mut setup, control(), control()).await;
+    assert_eq!(remote.grant().permissions, control());
+    let mut input = remote.take_input().unwrap();
+    let mut received = agent.take_input().unwrap();
+    let sent = [
+        InputMsg::Key {
+            code: KeyCode::IntlRo,
+            down: true,
+        },
+        InputMsg::Key {
+            code: KeyCode::IntlRo,
+            down: false,
+        },
+        InputMsg::MouseMove {
+            monitor: 0,
+            x: 65535,
+            y: 0,
+        },
+        InputMsg::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+        },
+        InputMsg::Wheel { dx: 0, dy: -120 },
+        InputMsg::Held,
+        InputMsg::ReleaseAll,
+    ];
+    for msg in &sent {
+        input.send(msg).await.unwrap();
+    }
+    for msg in sent {
+        let got = timeout(WAIT, received.recv()).await.unwrap().unwrap();
+        assert_eq!(got, Some(msg));
+    }
+    // Finishing the stream reads as its end.
+    input.finish();
+    assert_eq!(timeout(WAIT, received.recv()).await.unwrap().unwrap(), None);
+    assert_eq!(received.dropped(), 0);
+    remote.close().await;
+}
+
+#[tokio::test]
+async fn view_only_sessions_have_no_input() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    // Asked to control, but the local user allowed viewing only.
+    let (mut remote, mut agent) = requested(&mut setup, control(), Permissions::VIEW).await;
+    assert_eq!(remote.grant().permissions, Permissions::VIEW);
+    assert!(remote.take_input().is_none());
+    assert!(agent.take_input().is_none());
+    remote.close().await;
+}
+
+#[tokio::test]
+async fn cursor_updates_reach_the_viewer() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    let (mut remote, mut agent) = accepted(&mut setup, Permissions::VIEW).await;
+    let mut cursor = remote.take_cursor().unwrap();
+    let shape = CursorMsg::Shape {
+        id: 3,
+        hot_x: 1,
+        hot_y: 2,
+        width: 4,
+        height: 4,
+        rgba: BoundedBytes::new(vec![0x55; 64]).unwrap(),
+    };
+    let position = CursorMsg::Position {
+        x: 100,
+        y: 200,
+        visible: true,
+    };
+    let mut sender = agent.take_cursor().unwrap();
+    assert!(
+        agent.take_cursor().is_none(),
+        "the sender is handed out once"
+    );
+    sender.send(&shape).await.unwrap();
+    sender.send(&position).await.unwrap();
+    sender
+        .send(&CursorMsg::UseCachedShape { id: 3 })
+        .await
+        .unwrap();
+    assert_eq!(timeout(WAIT, cursor.recv()).await.unwrap().unwrap(), shape);
+    assert_eq!(
+        timeout(WAIT, cursor.recv()).await.unwrap().unwrap(),
+        position
+    );
+    assert_eq!(
+        timeout(WAIT, cursor.recv()).await.unwrap().unwrap(),
+        CursorMsg::UseCachedShape { id: 3 }
+    );
+    // An inconsistent shape is refused before it reaches the wire.
+    let broken = CursorMsg::Shape {
+        id: 4,
+        hot_x: 0,
+        hot_y: 0,
+        width: 4,
+        height: 4,
+        rgba: BoundedBytes::new(vec![0; 3]).unwrap(),
+    };
+    assert!(sender.send(&broken).await.is_err());
+    // Video still flows next to the cursor.
+    let mut video = remote.take_video().unwrap();
+    agent.video.send(&header(0, 5), &[9; 5]).await.unwrap();
+    let mut buf = Vec::new();
+    let got = timeout(WAIT, video.recv(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(got, header(0, 5));
+    remote.close().await;
 }

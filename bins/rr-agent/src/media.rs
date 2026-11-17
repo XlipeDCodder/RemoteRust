@@ -2,6 +2,11 @@
 //! §8.2): capture → BGRA→I420 → H.264 on a dedicated thread, frames sent
 //! from the async side.
 //!
+//! The capture thread also owns the session's input and cursor threads
+//! (see [`crate::input`] and [`crate::cursor`]): on Wayland the screen and
+//! the input come from one portal session, and both need the captured
+//! monitor's position, which only the capturer knows.
+//!
 //! "Latest frame wins": the capture thread only grabs the screen once the
 //! network has taken the previous frame (a one-permit semaphore). While it
 //! waits, DXGI folds screen updates together, so the next frame always
@@ -13,9 +18,13 @@ use std::time::{Duration, Instant};
 
 use rr_media::{EncoderSettings, I420, OpenH264Encoder, VideoEncoder, bgra_to_i420};
 use rr_net::{AgentSession, SessionEvent, monotonic_us};
-use rr_platform::capture::{self, CaptureError};
-use rr_proto::{AgentTimings, Codec, DisconnectReason, VideoFrameHeader};
+use rr_platform::capture::{self, CaptureError, Screen};
+use rr_platform::input::{Area, InputBackend, InputError};
+use rr_proto::{AgentTimings, Codec, CursorMsg, DisconnectReason, VideoFrameHeader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+use crate::cursor::{self, CursorThread};
+use crate::input::{self, InputThread, Queue};
 
 /// Frame rate cap for the software path (blueprint v2 §2.3: ≥ 30 fps).
 pub const MAX_FPS: u8 = 30;
@@ -27,6 +36,9 @@ const KEYFRAME_SPACING: Duration = Duration::from_millis(250);
 /// Pause before retrying after the capture was interrupted (desktop
 /// switch, secure desktop).
 const ACCESS_LOST_RETRY: Duration = Duration::from_millis(250);
+/// Pointer updates waiting for the network (the cursor thread retries
+/// when this is full).
+const CURSOR_QUEUE: usize = 8;
 
 /// One encoded frame on its way to the network, holding the "network
 /// busy" permit until it has been written.
@@ -55,6 +67,19 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
     let (frames_tx, mut frames_rx) = mpsc::channel::<Encoded>(1);
     let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
+    // Remote control: the network side fills the queue from the start; the
+    // capture thread starts injecting once the screen (and, on Wayland, the
+    // portal's input) is open.
+    let control = session.take_input().map(|receiver| {
+        let queue = Arc::new(Queue::default());
+        let reader = tokio::spawn(input::read(receiver, Arc::clone(&queue), handle.clone()));
+        (queue, reader)
+    });
+    let (cursor_tx, cursor_rx) = mpsc::channel::<CursorMsg>(CURSOR_QUEUE);
+    let cursor_task = session
+        .take_cursor()
+        .map(|sender| tokio::spawn(cursor::send(sender, cursor_rx)));
+
     let pipeline = Pipeline {
         monitor,
         flags: Arc::clone(&flags),
@@ -62,6 +87,8 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
         frames: frames_tx,
         recycled: recycle_rx,
         runtime: tokio::runtime::Handle::current(),
+        input: control.as_ref().map(|(queue, _)| Arc::clone(queue)),
+        cursor: cursor_tx,
     };
     let thread = std::thread::Builder::new()
         .name("rr-capture".to_owned())
@@ -97,6 +124,13 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
     flags.stop.store(true, Ordering::Relaxed);
     network_idle.close();
     drop(frames_rx);
+    if let Some((queue, reader)) = control {
+        reader.abort();
+        queue.end();
+    }
+    if let Some(task) = cursor_task {
+        task.abort();
+    }
     let joined = tokio::task::spawn_blocking(move || thread.join()).await;
     match joined {
         Ok(Ok(Ok(()))) => {}
@@ -125,6 +159,10 @@ struct Pipeline {
     frames: mpsc::Sender<Encoded>,
     recycled: std::sync::mpsc::Receiver<Vec<u8>>,
     runtime: tokio::runtime::Handle,
+    /// Input from the Viewer, when control was granted.
+    input: Option<Arc<Queue>>,
+    /// Pointer updates for the Viewer.
+    cursor: mpsc::Sender<CursorMsg>,
 }
 
 /// Why the capture thread stopped with an error.
@@ -160,7 +198,17 @@ impl Pipeline {
     }
 
     fn stream(&self, totals: &mut Totals) -> Result<(), PipelineError> {
-        let mut capturer = capture::open(self.monitor)?;
+        let Screen {
+            mut capturer,
+            input,
+            area,
+        } = capture::open_screen(self.monitor, self.input.is_some())?;
+        // Declared after the capturer, so dropped before it: input and the
+        // pointer stop first, then (on Wayland) the portal session closes.
+        let _input = self.start_input(input);
+        let _cursor = CursorThread::start(area.clone(), self.cursor.clone())
+            .inspect_err(|err| tracing::warn!(error = %err, "cannot start the cursor thread"))
+            .ok();
         let mut encoder = OpenH264Encoder::new(&EncoderSettings {
             max_fps: MAX_FPS,
             ..EncoderSettings::default()
@@ -219,6 +267,8 @@ impl Pipeline {
                 timings.convert_us = micros(started.elapsed());
                 folded = folded.saturating_add(frame.accumulated.saturating_sub(1));
             });
+            // The monitor may have moved or changed resolution.
+            area.set(Area::of(capturer.monitor()));
             match captured {
                 Ok(true) => {
                     converted?;
@@ -285,6 +335,31 @@ impl Pipeline {
             totals.sent += 1;
         }
         Ok(())
+    }
+}
+
+impl Pipeline {
+    /// Starts injecting the Viewer's input, if control was granted and
+    /// this system allows it. Without it the session stays view only.
+    fn start_input(
+        &self,
+        backend: Option<Result<Box<dyn InputBackend>, InputError>>,
+    ) -> Option<InputThread> {
+        let queue = self.input.as_ref()?;
+        let started = match backend? {
+            Ok(backend) => InputThread::start(backend, Arc::clone(queue), self.monitor)
+                .map_err(|err| err.to_string()),
+            Err(InputError::Denied) => Err("not allowed in the system dialog".to_owned()),
+            Err(err) => Err(err.to_string()),
+        };
+        match started {
+            Ok(thread) => Some(thread),
+            Err(reason) => {
+                println!("  Remote control is unavailable ({reason}); the session is view only.");
+                tracing::warn!(%reason, "remote control unavailable");
+                None
+            }
+        }
     }
 }
 

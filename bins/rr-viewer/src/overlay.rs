@@ -1,4 +1,5 @@
-//! Statistics overlay, toggled with F1 (blueprint v2 §8.10).
+//! Statistics overlay, toggled from the toolbar or, viewing only, with F1
+//! (blueprint v2 §8.10).
 //!
 //! Rates and stage times cover the last second. The latency line adds the
 //! stage times and half the round trip: the two clocks are never compared.
@@ -89,6 +90,7 @@ pub struct Overlay {
     display: String,
     encoder: String,
     picture: Option<(&'static str, u16, u16)>,
+    keys: &'static str,
     // Current second.
     shown: u32,
     sums: Stages,
@@ -98,7 +100,7 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn new(agent: &str, path: String) -> Self {
+    pub fn new(agent: &str, path: String, control: bool) -> Self {
         Self {
             visible: false,
             agent: agent.to_owned(),
@@ -106,6 +108,11 @@ impl Overlay {
             display: String::from("?"),
             encoder: String::from("?"),
             picture: None,
+            keys: if control {
+                "all keys go to the remote; toolbar at the top center"
+            } else {
+                "F1 overlay  F11 full screen  (toolbar at the top center)"
+            },
             shown: 0,
             sums: Stages::default(),
             last_tick: Instant::now(),
@@ -246,7 +253,7 @@ impl Overlay {
                     snap.folded, snap.replaced, snap.discarded, snap.errors
                 ),
             ),
-            ("Keys", String::from("F1 overlay  F11 full screen")),
+            ("Keys", String::from(self.keys)),
         ]
     }
 

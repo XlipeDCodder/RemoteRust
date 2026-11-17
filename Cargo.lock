@@ -3045,6 +3045,7 @@ version = "0.1.0"
 dependencies = [
  "ashpd",
  "pipewire",
+ "rr-proto",
  "rustix 1.1.6",
  "thiserror 2.0.21",
  "tokio",

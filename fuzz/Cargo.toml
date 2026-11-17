@@ -1,6 +1,6 @@
 # Fuzz targets (cargo-fuzz + libFuzzer). Requires a nightly toolchain:
 #   cargo install cargo-fuzz
-#   cargo +nightly fuzz run control_msg   (or video_header)
+#   cargo +nightly fuzz run control_msg   (or video_header, input_msg, cursor_msg)
 # Kept out of the main workspace: it needs nightly and sanitizer flags.
 [package]
 name = "rr-fuzz"
@@ -25,6 +25,20 @@ bench = false
 [[bin]]
 name = "video_header"
 path = "fuzz_targets/video_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_msg"
+path = "fuzz_targets/input_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_msg"
+path = "fuzz_targets/cursor_msg.rs"
 test = false
 doc = false
 bench = false

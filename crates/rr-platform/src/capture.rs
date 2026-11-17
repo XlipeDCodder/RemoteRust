@@ -11,6 +11,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::input::{Area, InputBackend, InputError, SharedArea};
+
 /// Maximum number of monitors reported.
 pub const MAX_MONITORS: usize = 16;
 
@@ -121,22 +123,97 @@ pub fn monitors() -> Result<Vec<Monitor>, CaptureError> {
     }
 }
 
-/// Opens a capturer for monitor `id` (see [`monitors`]).
+/// Opens a capturer for monitor `id` (see [`monitors`]), view only.
 ///
 /// # Errors
 /// [`CaptureError::NoSuchMonitor`], [`CaptureError::Unsupported`] or an
 /// OS failure.
 pub fn open(id: u8) -> Result<Box<dyn ScreenCapturer>, CaptureError> {
+    open_screen(id, false).map(|screen| screen.capturer)
+}
+
+/// A monitor opened for a session: its capturer and, with remote control,
+/// the matching input backend.
+pub struct Screen {
+    /// The capturer. Not `Send`: keep it on the thread that opened it.
+    pub capturer: Box<dyn ScreenCapturer>,
+    /// `None` when control was not asked for; otherwise the backend (to
+    /// wrap in an [`Injector`](crate::input::Injector), on any thread) or
+    /// why there is none, in which case the session can stay view only.
+    pub input: Option<Result<Box<dyn InputBackend>, InputError>>,
+    /// Where the captured monitor is, as input needs it. Keep it current
+    /// with [`Area::of`]`(capturer.monitor())` after each capture, since
+    /// the monitor may move or change resolution.
+    pub area: SharedArea,
+}
+
+impl std::fmt::Debug for Screen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Screen")
+            .field("monitor", self.capturer.monitor())
+            .field(
+                "input",
+                &self
+                    .input
+                    .as_ref()
+                    .map(|input| input.as_ref().map(|backend| backend.name())),
+            )
+            .field("area", &self.area.get())
+            .finish()
+    }
+}
+
+/// Opens monitor `id` (see [`monitors`]) and, with `control`, an input
+/// backend for it. On Wayland both come from one portal session, so the
+/// system dialog asks for the screen and for keyboard and pointer at once.
+///
+/// # Errors
+/// Capture failures only: [`CaptureError::NoSuchMonitor`],
+/// [`CaptureError::Unsupported`], [`CaptureError::Denied`] or an OS
+/// failure. Input failures are in [`Screen::input`].
+pub fn open_screen(id: u8, control: bool) -> Result<Screen, CaptureError> {
+    let area = SharedArea::default();
+    let (capturer, input) = open_backends(id, control, &area)?;
+    area.set(Area::of(capturer.monitor()));
+    Ok(Screen {
+        capturer,
+        input,
+        area,
+    })
+}
+
+type Backends = (
+    Box<dyn ScreenCapturer>,
+    Option<Result<Box<dyn InputBackend>, InputError>>,
+);
+
+fn open_backends(id: u8, control: bool, area: &SharedArea) -> Result<Backends, CaptureError> {
     #[cfg(windows)]
     {
-        Ok(Box::new(crate::win::capture::DxgiCapturer::open(id)?))
+        use crate::win::{capture::DxgiCapturer, input::SendInputBackend};
+        let capturer = DxgiCapturer::open(id)?;
+        let input = control
+            .then(|| Ok(Box::new(SendInputBackend::new(area.clone())) as Box<dyn InputBackend>));
+        Ok((Box::new(capturer), input))
     }
     #[cfg(target_os = "linux")]
     {
-        use crate::linux::{Backend, backend, portal, x11};
+        use crate::linux::{Backend, backend, portal, x11, x11_input};
         match backend()? {
-            Backend::X11 => Ok(Box::new(x11::X11Capturer::open(id)?)),
-            Backend::Portal => Ok(Box::new(portal::PortalCapturer::open(id)?)),
+            Backend::X11 => {
+                let capturer = x11::X11Capturer::open(id)?;
+                let input = control.then(|| {
+                    x11_input::XTestBackend::open(area.clone())
+                        .map(|backend| Box::new(backend) as Box<dyn InputBackend>)
+                });
+                Ok((Box::new(capturer), input))
+            }
+            Backend::Portal => {
+                let (capturer, input) = portal::PortalCapturer::open(id, control)?;
+                let input = input
+                    .map(|input| input.map(|backend| Box::new(backend) as Box<dyn InputBackend>));
+                Ok((Box::new(capturer), input))
+            }
         }
     }
 }

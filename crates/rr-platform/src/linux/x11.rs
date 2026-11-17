@@ -31,7 +31,7 @@ use x11rb::rust_connection::RustConnection;
 use crate::capture::{CaptureError, Frame, MAX_MONITORS, Monitor, ScreenCapturer};
 
 /// Wraps an X11 failure for `context`.
-fn x11_error(context: &'static str, err: impl Display) -> CaptureError {
+pub(crate) fn x11_error(context: &'static str, err: impl Display) -> CaptureError {
     CaptureError::Os {
         context,
         code: 0,
@@ -40,7 +40,7 @@ fn x11_error(context: &'static str, err: impl Display) -> CaptureError {
 }
 
 /// Opens the display named by `$DISPLAY` and returns its default screen.
-fn connect() -> Result<(RustConnection, xproto::Screen), CaptureError> {
+pub(crate) fn connect() -> Result<(RustConnection, xproto::Screen), CaptureError> {
     let (conn, screen) =
         x11rb::connect(None).map_err(|err| x11_error("connecting to the X server", err))?;
     let screen = conn
@@ -53,7 +53,10 @@ fn connect() -> Result<(RustConnection, xproto::Screen), CaptureError> {
 }
 
 /// Whether the server has extension `name`.
-fn has_extension(conn: &RustConnection, name: &'static str) -> Result<bool, CaptureError> {
+pub(crate) fn has_extension(
+    conn: &RustConnection,
+    name: &'static str,
+) -> Result<bool, CaptureError> {
     conn.extension_information(name)
         .map(|info| info.is_some())
         .map_err(|err| x11_error("QueryExtension", err))

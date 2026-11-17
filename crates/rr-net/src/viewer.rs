@@ -16,11 +16,14 @@ use tokio::time::timeout;
 use crate::SessionError;
 use crate::agent::{CLOSE_NORMAL, CLOSE_REFUSED, GOODBYE_TIMEOUT};
 use crate::channel::{ControlChannel, ControlWriter, monotonic_us, rtt_since};
+use crate::cursor::CursorReceiver;
 use crate::discovery;
 use crate::identity::{CERT_SERVER_NAME, DeviceIdentity};
+use crate::input::InputSender;
 use crate::pairing::{self, PairingKeys, SessionCode};
 use crate::race::{self, RaceError};
 use crate::session::CONSENT_TIMEOUT;
+use crate::streams;
 use crate::tls::{self, AgentKeyPolicy};
 use crate::video::VideoReceiver;
 
@@ -326,7 +329,11 @@ impl ViewerSession {
                 return Err(err);
             }
         };
-        let video = VideoReceiver::new(self.conn.clone());
+        let (video, cursor, router) = streams::route_agent_streams(self.conn.clone());
+        let input = grant
+            .permissions
+            .contains(Permissions::CONTROL)
+            .then(|| InputSender::new(self.conn.clone()));
         let (writer, reader) = self.ctl.split();
         let (incoming, reader_task) = reader.spawn();
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
@@ -337,12 +344,14 @@ impl ViewerSession {
             conn: self.conn,
             agent: self.agent,
             grant,
-            video: Some(video),
+            video: Some(VideoReceiver::new(video)),
+            cursor: Some(CursorReceiver::new(cursor)),
+            input,
             events: Some(event_rx),
             commands: SessionControl {
                 commands: command_tx,
             },
-            tasks: [control, reader_task],
+            tasks: [control, reader_task, router],
         })
     }
 
@@ -443,9 +452,11 @@ pub struct RemoteSession {
     agent: AgentInfo,
     grant: SessionGrant,
     video: Option<VideoReceiver>,
+    cursor: Option<CursorReceiver>,
+    input: Option<InputSender>,
     events: Option<mpsc::Receiver<RemoteEvent>>,
     commands: SessionControl,
-    tasks: [JoinHandle<()>; 2],
+    tasks: [JoinHandle<()>; 3],
 }
 
 impl RemoteSession {
@@ -470,6 +481,18 @@ impl RemoteSession {
     /// The video stream; `None` after the first call.
     pub fn take_video(&mut self) -> Option<VideoReceiver> {
         self.video.take()
+    }
+
+    /// The Agent's pointer updates; `None` after the first call. The Agent
+    /// may never send any (its cursor can be part of the video).
+    pub fn take_cursor(&mut self) -> Option<CursorReceiver> {
+        self.cursor.take()
+    }
+
+    /// Keyboard and mouse towards the Agent: `Some` (once) only when
+    /// `CONTROL` was granted.
+    pub fn take_input(&mut self) -> Option<InputSender> {
+        self.input.take()
     }
 
     /// Agent events; `None` after the first call.
@@ -500,9 +523,10 @@ impl RemoteSession {
     /// Ends the session politely and waits briefly for the close to be sent.
     pub async fn close(self) {
         self.commands.close();
-        let [control, reader] = self.tasks;
+        let [control, reader, router] = self.tasks;
         let _ = timeout(GOODBYE_TIMEOUT.saturating_add(GOODBYE_TIMEOUT), control).await;
         reader.abort();
+        router.abort();
         self.conn.close(CLOSE_NORMAL, b"");
         let _ = timeout(Duration::from_secs(1), self.endpoint.wait_idle()).await;
     }

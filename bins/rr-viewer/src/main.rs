@@ -4,12 +4,16 @@
 //! Unprivileged process: UI, path selection, decoding, rendering and local
 //! input capture.
 //!
-//! M2 build: pairing, path selection and view-only screen sessions in a
-//! window (software H.264, wgpu presentation, F1 statistics overlay).
+//! M3 build: pairing, path selection and screen sessions in a window
+//! (software H.264, wgpu presentation, statistics overlay) with remote
+//! keyboard and mouse, the remote pointer and a toolbar at the top.
 #![forbid(unsafe_code)]
 
+mod cursor;
+mod input;
 mod overlay;
 mod render;
+mod toolbar;
 mod video;
 mod window;
 
@@ -55,16 +59,20 @@ enum Command {
         #[arg(long)]
         code: Option<String>,
     },
-    /// View a paired Agent's screen in a window (its user must accept).
+    /// Open a paired Agent's screen in a window, with keyboard and mouse
+    /// control (its user must accept, and may allow viewing only).
     Connect {
         /// Agent name or key prefix (8+ hex characters).
         agent: String,
         /// Open the window on this local display (0 is the first one).
         #[arg(long, value_name = "INDEX")]
         display: Option<usize>,
-        /// Start in full screen (F11 toggles it).
+        /// Start in full screen (the toolbar at the top toggles it).
         #[arg(long)]
         fullscreen: bool,
+        /// Only watch: ask for no keyboard and mouse control.
+        #[arg(long)]
+        view_only: bool,
     },
     /// Measure the round trip to a paired Agent over the best path.
     Ping {
@@ -132,11 +140,13 @@ fn main() -> anyhow::Result<()> {
             agent,
             display,
             fullscreen,
+            view_only,
         } => connect(
             &runtime,
             &paths,
             &config,
             &agent,
+            view_only,
             window::Options {
                 display,
                 fullscreen,
@@ -246,6 +256,7 @@ fn connect(
     paths: &Paths,
     config: &Config,
     query: &str,
+    view_only: bool,
     options: window::Options,
 ) -> anyhow::Result<()> {
     let (session, path) = runtime.block_on(open_session(paths, config, query))?;
@@ -254,7 +265,12 @@ fn connect(
         session.agent_name(),
         CONSENT_TIMEOUT.as_secs()
     );
-    let remote = match runtime.block_on(session.start(Permissions::VIEW)) {
+    let wanted = if view_only {
+        Permissions::VIEW
+    } else {
+        Permissions::VIEW.union(Permissions::CONTROL)
+    };
+    let remote = match runtime.block_on(session.start(wanted)) {
         Ok(remote) => remote,
         Err(SessionError::Closed(reason)) => bail!("{}", describe(reason)),
         Err(err) => return Err(explain(err)).context("the screen session did not start"),
@@ -276,7 +292,17 @@ fn connect(
             );
         }
     }
-    println!("Press F1 in the window for statistics, F11 for full screen.");
+    if grant.permissions.contains(Permissions::CONTROL) {
+        println!(
+            "Keyboard and mouse go to the remote. Point at the top center of the window for \
+             the toolbar (statistics, full screen, disconnect)."
+        );
+    } else {
+        if !view_only {
+            println!("The Agent allowed viewing only.");
+        }
+        println!("Press F1 in the window for statistics, F11 for full screen.");
+    }
 
     let (outcome, summary) = window::run(runtime, remote, path, options)?;
     match outcome {

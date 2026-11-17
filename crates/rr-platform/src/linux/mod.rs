@@ -3,6 +3,8 @@
 
 pub(crate) mod portal;
 pub(crate) mod x11;
+pub(crate) mod x11_cursor;
+pub(crate) mod x11_input;
 
 use crate::capture::CaptureError;
 

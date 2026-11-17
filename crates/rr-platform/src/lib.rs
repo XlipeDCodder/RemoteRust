@@ -4,15 +4,19 @@
 //! module opts out of the workspace-wide `unsafe_code = "deny"` explicitly,
 //! and every `unsafe` block carries a `// SAFETY:` justification.
 //!
-//! Platform traits: [`capture::ScreenCapturer`] (M2); planned:
-//! `InputInjector`, `CursorSource`, `DesktopStateWatcher`,
-//! `KillSwitchHotkey`, `SessionIndicator`.
+//! Platform traits: [`capture::ScreenCapturer`] (M2),
+//! [`input::InputBackend`] (M3); planned: `CursorSource`,
+//! `DesktopStateWatcher`, `KillSwitchHotkey`, `SessionIndicator`.
 
 #[cfg(not(any(windows, target_os = "linux")))]
 compile_error!("RustRemote supports only Windows and Linux (blueprint v2 §2).");
 
 pub mod capture;
+pub mod cursor;
+pub mod hook;
 pub mod host;
+pub mod input;
+pub mod keymap;
 pub mod secret;
 
 #[cfg(target_os = "linux")]

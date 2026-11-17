@@ -21,6 +21,9 @@
 //!                       ◄───────────────── SessionStart  or  Disconnect
 //!                       ◄───────────────── VideoEncoder{name}
 //!                       ◄═════════════════ video stream (unidirectional)
+//!                       ◄═════════════════ cursor stream (unidirectional,
+//!                                           when the Agent can read it)
+//!   input stream ════════════════════════►  (unidirectional, CONTROL only)
 //!   RequestKeyframe ─────────────────────►
 //!   -- any time --
 //!   Ping / Pong (either direction) ◄─────►

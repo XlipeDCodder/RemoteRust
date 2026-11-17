@@ -10,6 +10,17 @@ use anyhow::Context as _;
 use rr_media::I420;
 use winit::window::Window;
 
+/// Where the picture is drawn in the window, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PictureRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Window pixels per picture pixel.
+    pub scale: f32,
+}
+
 /// An overlay frame ready to draw.
 pub struct OverlayFrame {
     pub primitives: Vec<egui::ClippedPrimitive>,
@@ -265,6 +276,26 @@ impl Renderer {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         self.surface.configure(&self.device, &self.config);
         pollster::block_on(scope.pop())
+    }
+
+    /// Where the current picture is drawn, once there is one.
+    #[allow(clippy::cast_precision_loss)] // sizes are far below 2^24
+    pub fn picture_rect(&self) -> Option<PictureRect> {
+        let planes = self.planes.as_ref()?;
+        if self.config.width == 0 || self.config.height == 0 {
+            return None;
+        }
+        let [x, y, width, height] = letterbox(
+            (self.config.width, self.config.height),
+            (planes.width, planes.height),
+        );
+        Some(PictureRect {
+            x,
+            y,
+            width,
+            height,
+            scale: width / planes.width.max(1) as f32,
+        })
     }
 
     /// Follows the window size (in physical pixels). A minimized window has

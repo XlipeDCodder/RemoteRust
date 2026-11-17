@@ -1,6 +1,12 @@
 //! The session window (blueprint v2 §8.6): the winit event loop runs on the
 //! main thread, the network on the tokio runtime, decoding on its own
 //! thread. A frame is drawn as soon as it is decoded.
+//!
+//! With control, the keyboard and mouse go to the Agent ([`crate::input`]).
+//! Every key goes there, and on Windows a low-level hook takes system
+//! shortcuts too (Alt+Tab, the Windows key) while the window has the focus.
+//! The Viewer's own functions then live in the toolbar at the top center
+//! ([`crate::toolbar`]). Viewing only, F1 and F11 also work locally.
 
 use std::fmt;
 use std::sync::Arc;
@@ -8,23 +14,30 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use rr_net::{RemoteEvent, RemoteSession, SessionControl, StatsSource};
-use rr_proto::DisconnectReason;
+use rr_net::{CursorReceiver, RemoteEvent, RemoteSession, SessionControl, StatsSource};
+use rr_platform::hook::KeyboardHook;
+use rr_platform::input::InputError;
+use rr_proto::{CursorMsg, DisconnectReason, KeyCode as RemoteKey};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
+use crate::cursor::{RemoteCursor, Sprite};
+use crate::input::{self, RemoteInput};
 use crate::overlay::Overlay;
-use crate::render::{OverlayFrame, Renderer};
+use crate::render::{OverlayFrame, PictureRect, Renderer};
+use crate::toolbar::{Action, Toolbar};
 use crate::video::Pipeline;
 
 /// How often the overlay statistics are refreshed.
 const STATS_PERIOD: Duration = Duration::from_secs(1);
+/// Longest wait for held input to be released on the Agent when closing.
+const INPUT_DRAIN: Duration = Duration::from_millis(500);
 
 /// Events sent to the window from other threads.
 #[derive(Debug)]
@@ -37,6 +50,10 @@ pub enum UserEvent {
     Ended(Option<DisconnectReason>),
     /// The video stream broke.
     VideoFailed(String),
+    /// A key taken by the keyboard hook (Windows, with control).
+    Key(RemoteKey, bool),
+    /// A pointer update from the Agent.
+    Cursor(CursorMsg),
 }
 
 /// Window placement.
@@ -115,8 +132,24 @@ pub fn run(
         .context("the session events were already taken")?;
     let control = session.control();
     let pipeline = Pipeline::start(runtime.handle(), video, control.clone(), proxy.clone())?;
-    runtime.spawn(forward_events(events, proxy));
+    runtime.spawn(forward_events(events, proxy.clone()));
+    let cursor_task = session
+        .take_cursor()
+        .map(|cursor| runtime.spawn(forward_cursor(cursor, proxy.clone())));
 
+    // Only present when the Agent granted control.
+    let monitor = session.grant().monitor;
+    let (input, input_task) = match session.take_input() {
+        Some(sender) => {
+            let (queue, outgoing) = mpsc::unbounded_channel();
+            (
+                Some(RemoteInput::new(queue, monitor)),
+                Some(runtime.spawn(input::send(sender, outgoing))),
+            )
+        }
+        None => (None, None),
+    };
+    let hook = input.as_ref().and_then(|_| install_hook(proxy.clone()));
     let grant = session.grant();
     let picture_size = grant
         .monitors
@@ -126,15 +159,20 @@ pub fn run(
         // 0 × 0: the size is unknown until the first frame (the Agent's
         // user picks the screen in a system dialog).
         .filter(|&(width, height)| width > 0 && height > 0);
+    let mode = if input.is_some() {
+        "control"
+    } else {
+        "view only"
+    };
     let mut app = App {
-        title: format!("{} - RustRemote (view only)", session.agent_name()),
+        title: format!("{} - RustRemote ({mode})", session.agent_name()),
         options,
         picture_size,
         window: None,
         renderer: None,
         egui: egui::Context::default(),
         egui_state: None,
-        overlay: Overlay::new(session.agent_name(), path),
+        overlay: Overlay::new(session.agent_name(), path, input.is_some()),
         pipeline: &pipeline,
         stats: session.stats_source(),
         control,
@@ -142,12 +180,25 @@ pub fn run(
         outcome: None,
         video_error: None,
         shown: 0,
+        input,
+        hook,
+        cursor: RemoteCursor::default(),
+        toolbar: Toolbar::default(),
+        pointer: None,
+        applied_cursor: None,
     };
     let result = event_loop.run_app(&mut app);
     let outcome = app.outcome.take().unwrap_or(Outcome::Closed);
     let shown = app.shown;
-    // Close the window first, then end the session politely.
+    // Close the window first (releasing anything held on the Agent and
+    // ending the input stream), then end the session politely.
     drop(app);
+    if let Some(task) = input_task {
+        let _ = runtime.block_on(tokio::time::timeout(INPUT_DRAIN, task));
+    }
+    if let Some(task) = cursor_task {
+        task.abort();
+    }
     runtime.block_on(session.close());
     let counters = &pipeline.counters;
     let summary = Summary {
@@ -178,6 +229,50 @@ async fn forward_events(mut events: mpsc::Receiver<RemoteEvent>, proxy: EventLoo
     let _ = proxy.send_event(UserEvent::Ended(None));
 }
 
+/// Passes pointer updates to the window. The Agent may never open the
+/// stream (Wayland draws the pointer into the video).
+async fn forward_cursor(mut cursor: CursorReceiver, proxy: EventLoopProxy<UserEvent>) {
+    loop {
+        match cursor.recv().await {
+            Ok(msg) => {
+                if proxy.send_event(UserEvent::Cursor(msg)).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "cursor stream closed");
+                return;
+            }
+        }
+    }
+}
+
+/// The keyboard hook, where the platform has one (Windows).
+fn install_hook(proxy: EventLoopProxy<UserEvent>) -> Option<KeyboardHook> {
+    let hook = KeyboardHook::install(move |key, down| {
+        let _ = proxy.send_event(UserEvent::Key(key, down));
+    });
+    match hook {
+        Ok(hook) => Some(hook),
+        Err(InputError::Unsupported(reason)) => {
+            tracing::debug!(reason, "system shortcuts stay local");
+            None
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot capture system shortcuts; they stay local");
+            None
+        }
+    }
+}
+
+/// What the local pointer looks like over the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPointer {
+    Arrow,
+    Hidden,
+    Remote,
+}
+
 struct App<'a> {
     title: String,
     options: Options,
@@ -195,6 +290,16 @@ struct App<'a> {
     video_error: Option<String>,
     /// Pictures presented so far.
     shown: u64,
+    /// Present only with control.
+    input: Option<RemoteInput>,
+    /// Present only with control, on Windows.
+    hook: Option<KeyboardHook>,
+    cursor: RemoteCursor,
+    toolbar: Toolbar,
+    /// The local pointer, in window pixels, while it is over the window.
+    pointer: Option<(f64, f64)>,
+    /// The local pointer set last; `None` forces setting it again.
+    applied_cursor: Option<LocalPointer>,
 }
 
 impl App<'_> {
@@ -262,7 +367,7 @@ impl App<'_> {
     /// Draws the newest decoded picture, if there is one. Until the window
     /// is ready, pictures stay in the mailbox (a static screen may send
     /// only one).
-    fn show_frame(&mut self) {
+    fn show_frame(&mut self, event_loop: &ActiveEventLoop) {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
@@ -270,38 +375,285 @@ impl App<'_> {
             return;
         };
         renderer.upload(&frame.picture);
-        if self.redraw() {
+        let (shown, action) = self.redraw();
+        if shown {
             self.shown = self.shown.saturating_add(1);
             self.overlay.on_frame(&frame, frame.decoded_at.elapsed());
         }
         self.pipeline.mailbox.recycle(frame);
+        self.act(event_loop, action);
     }
 
-    /// Draws the window. Returns `false` if nothing could be shown.
-    fn redraw(&mut self) -> bool {
+    /// Draws the window. Returns `false` if nothing could be shown, and
+    /// what was clicked in the toolbar.
+    fn redraw(&mut self) -> (bool, Option<Action>) {
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
-            return false;
+            return (false, None);
+        };
+        let mut action = None;
+        let picture = renderer.picture_rect();
+        let sprite = if self.input.is_none() {
+            self.cursor.sprite(&self.egui)
+        } else {
+            None
         };
         let overlay = match &mut self.egui_state {
-            Some(state) if self.overlay.visible => {
+            Some(state) => {
                 let input = state.take_egui_input(window);
-                let output = self.egui.run_ui(input, |ui| self.overlay.ui(ui));
-                state.handle_platform_output(window, output.platform_output);
+                let mode = if self.input.is_some() {
+                    "Control"
+                } else {
+                    "View only"
+                };
+                let fullscreen = window.fullscreen().is_some();
+                let output = self.egui.run_ui(input, |ui| {
+                    if self.overlay.visible {
+                        self.overlay.ui(ui);
+                    }
+                    if let (Some(sprite), Some(picture)) = (&sprite, picture) {
+                        paint_sprite(ui.ctx(), sprite, picture);
+                    }
+                    action = self
+                        .toolbar
+                        .ui(ui.ctx(), mode, self.overlay.visible, fullscreen);
+                });
+                // The platform output (cursor icon, clipboard, IME) is not
+                // applied: this window manages its own pointer.
                 Some(OverlayFrame {
                     primitives: self.egui.tessellate(output.shapes, output.pixels_per_point),
                     textures: output.textures_delta,
                     pixels_per_point: output.pixels_per_point,
                 })
             }
-            _ => None,
+            None => None,
         };
-        renderer.render(overlay)
+        (renderer.render(overlay), action)
+    }
+
+    fn act(&mut self, event_loop: &ActiveEventLoop, action: Option<Action>) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        match action {
+            Some(Action::ToggleStats) => self.overlay.visible = !self.overlay.visible,
+            Some(Action::ToggleFullscreen) => toggle_fullscreen(&window),
+            Some(Action::Disconnect) => {
+                self.finish(event_loop, Outcome::Closed);
+                return;
+            }
+            None => return,
+        }
+        window.request_redraw();
     }
 
     fn finish(&mut self, event_loop: &ActiveEventLoop, outcome: Outcome) {
         self.outcome.get_or_insert(outcome);
         event_loop.exit();
     }
+
+    /// The local pointer in egui points, and the window width in points.
+    #[allow(clippy::cast_possible_truncation)] // window coordinates fit an f32
+    fn pointer_points(&self) -> (Option<egui::Pos2>, f32) {
+        let Some(window) = &self.window else {
+            return (None, 0.0);
+        };
+        let scale = window.scale_factor();
+        let width = (f64::from(window.inner_size().width) / scale) as f32;
+        let pointer = self
+            .pointer
+            .map(|(x, y)| egui::pos2((x / scale) as f32, (y / scale) as f32));
+        (pointer, width)
+    }
+
+    fn over_toolbar(&self) -> bool {
+        let (pointer, width) = self.pointer_points();
+        pointer.is_some_and(|pointer| self.toolbar.contains(pointer, width))
+    }
+
+    /// Whether the local pointer is over the remote picture (not over the
+    /// toolbar or the black bars).
+    fn over_picture(&self) -> bool {
+        let (Some(pointer), Some(picture)) = (
+            self.pointer,
+            self.renderer.as_ref().and_then(Renderer::picture_rect),
+        ) else {
+            return false;
+        };
+        !self.over_toolbar() && input::picture_coords(pointer, picture, false).is_some()
+    }
+
+    /// Shows the remote pointer's shape over the picture (with control),
+    /// hidden when the Agent hides it, and the usual arrow elsewhere.
+    fn update_local_pointer(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let wanted = if self.input.is_some() && self.cursor.has_shape() && self.over_picture() {
+            if self.cursor.visible() {
+                LocalPointer::Remote
+            } else {
+                LocalPointer::Hidden
+            }
+        } else {
+            LocalPointer::Arrow
+        };
+        if self.applied_cursor == Some(wanted) {
+            return;
+        }
+        match wanted {
+            LocalPointer::Remote => {
+                match self.cursor.native(event_loop) {
+                    Some(cursor) => window.set_cursor(cursor),
+                    None => window.set_cursor(CursorIcon::Default),
+                }
+                window.set_cursor_visible(true);
+            }
+            LocalPointer::Hidden => window.set_cursor_visible(false),
+            LocalPointer::Arrow => {
+                window.set_cursor(CursorIcon::Default);
+                window.set_cursor_visible(true);
+            }
+        }
+        self.applied_cursor = Some(wanted);
+    }
+
+    fn on_focus(&mut self, focused: bool) {
+        if let Some(hook) = &self.hook {
+            hook.set_active(focused);
+        }
+        if !focused && let Some(input) = &mut self.input {
+            input.release_all(Instant::now());
+        }
+    }
+
+    fn on_key(&mut self, window: &Window, event: &KeyEvent) {
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        let down = event.state == ElementState::Pressed;
+        match &mut self.input {
+            Some(input) => {
+                // With the hook, keys arrive as `UserEvent::Key` instead.
+                if self.hook.is_none()
+                    && let Some(key) = input::key_code(code)
+                {
+                    input.key(key, down, Instant::now());
+                }
+            }
+            None if down && !event.repeat => match code {
+                KeyCode::F1 => {
+                    self.overlay.visible = !self.overlay.visible;
+                    window.request_redraw();
+                }
+                KeyCode::F11 => toggle_fullscreen(window),
+                _ => {}
+            },
+            None => {}
+        }
+    }
+
+    fn on_pointer(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window: &Window,
+        position: Option<PhysicalPosition<f64>>,
+    ) {
+        self.pointer = position.map(|position| (position.x, position.y));
+        let (points, width) = self.pointer_points();
+        if self.toolbar.pointer_moved(points, width) {
+            window.request_redraw();
+        }
+        self.update_local_pointer(event_loop);
+        let over_toolbar = self.over_toolbar();
+        let picture = self.renderer.as_ref().and_then(Renderer::picture_rect);
+        let (Some(input), Some(pointer), Some(picture)) = (&mut self.input, self.pointer, picture)
+        else {
+            return;
+        };
+        // A drag keeps going, pinned to the picture's edge, wherever the
+        // pointer goes.
+        let dragging = input.dragging();
+        if over_toolbar && !dragging {
+            return;
+        }
+        if let Some((x, y)) = input::picture_coords(pointer, picture, dragging) {
+            input.move_to(x, y, Instant::now());
+        }
+    }
+
+    fn on_button(&mut self, state: ElementState, button: MouseButton) {
+        let Some(button) = input::mouse_button(button) else {
+            return;
+        };
+        let down = state == ElementState::Pressed;
+        // Presses count only over the picture; releases always do, so
+        // nothing stays pressed on the Agent.
+        let over_picture = self.over_picture();
+        if let Some(input) = &mut self.input
+            && (!down || over_picture)
+        {
+            input.button(button, down, Instant::now());
+        }
+    }
+
+    fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        if !self.over_picture() {
+            return;
+        }
+        let Some(input) = &mut self.input else {
+            return;
+        };
+        // winit: positive values move the content right and down, that is
+        // scroll left and up; the protocol's dx > 0 scrolls right.
+        let now = Instant::now();
+        match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                input.wheel_notches(-f64::from(x), f64::from(y), now);
+            }
+            MouseScrollDelta::PixelDelta(position) => {
+                input.wheel_pixels(-position.x, position.y, now);
+            }
+        }
+    }
+}
+
+fn toggle_fullscreen(window: &Window) {
+    let next = if window.fullscreen().is_some() {
+        None
+    } else {
+        Some(Fullscreen::Borderless(window.current_monitor()))
+    };
+    window.set_fullscreen(next);
+}
+
+/// Paints the remote pointer over the picture, scaled like the picture.
+fn paint_sprite(ctx: &egui::Context, sprite: &Sprite, picture: PictureRect) {
+    let ppp = ctx.pixels_per_point();
+    let fraction = |coord: u16| f32::from(coord) / 65_536.0;
+    let hot = egui::pos2(
+        picture.x + fraction(sprite.position.0) * picture.width,
+        picture.y + fraction(sprite.position.1) * picture.height,
+    );
+    let min = egui::pos2(
+        hot.x - sprite.hot.0 * picture.scale,
+        hot.y - sprite.hot.1 * picture.scale,
+    );
+    let size = egui::vec2(sprite.size.0 * picture.scale, sprite.size.1 * picture.scale);
+    let rect = egui::Rect::from_min_size(min, size);
+    let rect = egui::Rect::from_min_max(
+        (rect.min.to_vec2() / ppp).to_pos2(),
+        (rect.max.to_vec2() / ppp).to_pos2(),
+    );
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::unique("rr-remote-cursor"),
+    ))
+    .image(
+        sprite.texture,
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 
 impl ApplicationHandler<UserEvent> for App<'_> {
@@ -310,7 +662,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             return;
         }
         match self.open(event_loop) {
-            Ok(()) => self.show_frame(),
+            Ok(()) => self.show_frame(event_loop),
             Err(err) => self.finish(event_loop, Outcome::Failed(format!("{err:#}"))),
         }
     }
@@ -321,7 +673,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         };
         if let Some(state) = &mut self.egui_state {
             let response = state.on_window_event(&window, &event);
-            if response.repaint && self.overlay.visible {
+            if response.repaint && (self.overlay.visible || self.over_toolbar()) {
                 window.request_redraw();
             }
         }
@@ -334,39 +686,24 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                self.redraw();
+                let (_, action) = self.redraw();
+                self.act(event_loop, action);
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => match code {
-                KeyCode::F1 => {
-                    self.overlay.visible = !self.overlay.visible;
-                    window.request_redraw();
-                }
-                KeyCode::F11 => {
-                    let next = if window.fullscreen().is_some() {
-                        None
-                    } else {
-                        Some(Fullscreen::Borderless(window.current_monitor()))
-                    };
-                    window.set_fullscreen(next);
-                }
-                _ => {}
-            },
+            WindowEvent::Focused(focused) => self.on_focus(focused),
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(&window, &event),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.on_pointer(event_loop, &window, Some(position));
+            }
+            WindowEvent::CursorLeft { .. } => self.on_pointer(event_loop, &window, None),
+            WindowEvent::MouseInput { state, button, .. } => self.on_button(state, button),
+            WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
             _ => {}
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Frame => self.show_frame(),
+            UserEvent::Frame => self.show_frame(event_loop),
             UserEvent::Encoder(name) => {
                 self.overlay.set_encoder(name);
                 if let (Some(window), true) = (&self.window, self.overlay.visible) {
@@ -388,6 +725,21 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 self.video_error.get_or_insert(error);
                 self.control.close();
             }
+            UserEvent::Key(key, down) => {
+                if let Some(input) = &mut self.input {
+                    input.key(key, down, Instant::now());
+                }
+            }
+            UserEvent::Cursor(msg) => {
+                if self.cursor.update(msg) {
+                    self.applied_cursor = None;
+                }
+                if self.input.is_some() {
+                    self.update_local_pointer(event_loop);
+                } else if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -408,7 +760,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
+        let mut wake = self.next_tick;
+        if let Some(due) = self.input.as_mut().and_then(|input| input.tick(now)) {
+            wake = wake.min(due);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }
 

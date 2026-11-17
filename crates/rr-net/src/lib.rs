@@ -21,22 +21,27 @@
 
 pub mod agent;
 mod channel;
+pub mod cursor;
 pub mod discovery;
 mod error;
 pub mod identity;
+pub mod input;
 pub mod listen;
 pub mod pairing;
 pub mod race;
 pub mod session;
+mod streams;
 mod tls;
 pub mod video;
 pub mod viewer;
 
 pub use agent::{Agent, AgentOptions, SourceFilter};
 pub use channel::monotonic_us;
+pub use cursor::{CursorReceiver, CursorSender};
 pub use discovery::{LocalInterface, discover};
 pub use error::SessionError;
 pub use identity::{DeviceIdentity, Fingerprint, IdentityError, default_identity_path};
+pub use input::{InputReceiver, InputSender};
 pub use listen::{ListenPlan, ListenTarget, ListenerSet, plan_listeners, run_listeners};
 pub use pairing::{CodePolicy, PairingCodes, SessionCode};
 pub use race::RaceError;
