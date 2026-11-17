@@ -7,24 +7,37 @@ use std::time::Duration;
 use rr_config::{KnownAgent, MAX_KNOWN_ADDRESSES, sanitize_device_name};
 use rr_proto::{
     BoundedString, CandidateAddr, ControlMsg, DevicePublicKey, DisconnectReason, Intent,
-    MAX_DEVICE_NAME, NetworkClass,
+    MAX_DEVICE_NAME, MonitorInfo, NetworkClass, Permissions,
 };
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::SessionError;
 use crate::agent::{CLOSE_NORMAL, CLOSE_REFUSED, GOODBYE_TIMEOUT};
-use crate::channel::{ControlChannel, monotonic_us, rtt_since};
+use crate::channel::{ControlChannel, ControlWriter, monotonic_us, rtt_since};
 use crate::discovery;
 use crate::identity::{CERT_SERVER_NAME, DeviceIdentity};
 use crate::pairing::{self, PairingKeys, SessionCode};
 use crate::race::{self, RaceError};
+use crate::session::CONSENT_TIMEOUT;
 use crate::tls::{self, AgentKeyPolicy};
+use crate::video::VideoReceiver;
 
 /// Limit for reaching an Agent and authenticating.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Limit for a `Pong` to come back.
 pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Extra time, on top of the Agent's consent timeout, for its answer to
+/// arrive.
+const CONSENT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Commands buffered for the session's control task.
+const COMMAND_QUEUE: usize = 8;
+/// Events buffered for the application.
+const EVENT_QUEUE: usize = 16;
 
 /// This machine in the Viewer role.
 #[derive(Debug, Clone)]
@@ -287,4 +300,276 @@ impl ViewerSession {
         self.conn.close(CLOSE_NORMAL, b"");
         let _ = timeout(Duration::from_secs(1), self.endpoint.wait_idle()).await;
     }
+
+    /// Asks for a screen session. The Agent's local user must accept, so
+    /// this can take up to the consent timeout (30 s) plus a margin.
+    ///
+    /// # Errors
+    /// [`SessionError::Closed`] with `ConsentDenied` / `ConsentTimeout`
+    /// when refused, [`SessionError::Timeout`], or any stream error.
+    pub async fn start(mut self, permissions: Permissions) -> Result<RemoteSession, SessionError> {
+        let result = timeout(
+            CONSENT_TIMEOUT.saturating_add(CONSENT_MARGIN),
+            self.request(permissions),
+        )
+        .await
+        .map_err(SessionError::from)
+        .and_then(|inner| inner);
+        let grant = match result {
+            Ok(grant) => grant,
+            Err(err) => {
+                if !matches!(err, SessionError::Closed(_)) {
+                    let _ =
+                        timeout(GOODBYE_TIMEOUT, self.ctl.goodbye(DisconnectReason::Normal)).await;
+                }
+                self.conn.close(CLOSE_REFUSED, b"");
+                return Err(err);
+            }
+        };
+        let video = VideoReceiver::new(self.conn.clone());
+        let (writer, reader) = self.ctl.split();
+        let (incoming, reader_task) = reader.spawn();
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+        let control = tokio::spawn(run_control(writer, incoming, command_rx, event_tx));
+        Ok(RemoteSession {
+            endpoint: self.endpoint,
+            conn: self.conn,
+            agent: self.agent,
+            grant,
+            video: Some(video),
+            events: Some(event_rx),
+            commands: SessionControl {
+                commands: command_tx,
+            },
+            tasks: [control, reader_task],
+        })
+    }
+
+    async fn request(&mut self, permissions: Permissions) -> Result<SessionGrant, SessionError> {
+        self.ctl
+            .send(&ControlMsg::RequestSession { permissions })
+            .await?;
+        loop {
+            match self.ctl.recv_active().await? {
+                ControlMsg::ConsentPending | ControlMsg::Pong { .. } => {}
+                ControlMsg::Ping { t_us } => self.ctl.send(&ControlMsg::Pong { t_us }).await?,
+                ControlMsg::SessionStart {
+                    permissions: granted,
+                    monitors,
+                    monitor,
+                } => {
+                    if !permissions.contains(granted) || !granted.contains(Permissions::VIEW) {
+                        return Err(SessionError::Protocol("unexpected permissions granted"));
+                    }
+                    let monitors = monitors.into_inner();
+                    if !monitors.iter().any(|candidate| candidate.id == monitor) {
+                        return Err(SessionError::Protocol("unknown monitor"));
+                    }
+                    return Ok(SessionGrant {
+                        permissions: granted,
+                        monitors,
+                        monitor,
+                    });
+                }
+                _ => return Err(SessionError::Protocol("unexpected control message")),
+            }
+        }
+    }
+}
+
+/// What the Agent granted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGrant {
+    /// Granted permissions.
+    pub permissions: Permissions,
+    /// The Agent's monitors.
+    pub monitors: Vec<MonitorInfo>,
+    /// The monitor being streamed.
+    pub monitor: u8,
+}
+
+/// Something the Agent said during a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEvent {
+    /// The Agent now encodes with this encoder.
+    Encoder(String),
+    /// The session is over; `Some` carries the Agent's reason.
+    Ended(Option<DisconnectReason>),
+}
+
+/// Cheap, cloneable control over a [`RemoteSession`], usable from any
+/// thread.
+#[derive(Debug, Clone)]
+pub struct SessionControl {
+    commands: mpsc::Sender<ViewerCommand>,
+}
+
+#[derive(Debug)]
+enum ViewerCommand {
+    RequestKeyframe,
+    Close,
+}
+
+impl SessionControl {
+    /// Asks the Agent for a keyframe (after a decode error). Requests made
+    /// while one is still queued are coalesced.
+    pub fn request_keyframe(&self) {
+        let _ = self.commands.try_send(ViewerCommand::RequestKeyframe);
+    }
+
+    /// Ends the session.
+    pub fn close(&self) {
+        let _ = self.commands.try_send(ViewerCommand::Close);
+    }
+}
+
+/// Path statistics for the overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathStats {
+    /// QUIC's smoothed RTT estimate.
+    pub rtt: Duration,
+    /// Packets sent so far.
+    pub sent_packets: u64,
+    /// Packets declared lost so far.
+    pub lost_packets: u64,
+}
+
+/// A running screen session on the Viewer.
+#[derive(Debug)]
+pub struct RemoteSession {
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    agent: AgentInfo,
+    grant: SessionGrant,
+    video: Option<VideoReceiver>,
+    events: Option<mpsc::Receiver<RemoteEvent>>,
+    commands: SessionControl,
+    tasks: [JoinHandle<()>; 2],
+}
+
+impl RemoteSession {
+    /// What the Agent granted.
+    #[must_use]
+    pub const fn grant(&self) -> &SessionGrant {
+        &self.grant
+    }
+
+    /// The Agent's name (sanitized).
+    #[must_use]
+    pub fn agent_name(&self) -> &str {
+        &self.agent.name
+    }
+
+    /// The address this session runs over.
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
+    /// The video stream; `None` after the first call.
+    pub fn take_video(&mut self) -> Option<VideoReceiver> {
+        self.video.take()
+    }
+
+    /// Agent events; `None` after the first call.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<RemoteEvent>> {
+        self.events.take()
+    }
+
+    /// A control handle.
+    #[must_use]
+    pub fn control(&self) -> SessionControl {
+        self.commands.clone()
+    }
+
+    /// Current path statistics.
+    #[must_use]
+    pub fn path_stats(&self) -> PathStats {
+        self.stats_source().path_stats()
+    }
+
+    /// A cheap handle to read path statistics from another task.
+    #[must_use]
+    pub fn stats_source(&self) -> StatsSource {
+        StatsSource {
+            conn: self.conn.clone(),
+        }
+    }
+
+    /// Ends the session politely and waits briefly for the close to be sent.
+    pub async fn close(self) {
+        self.commands.close();
+        let [control, reader] = self.tasks;
+        let _ = timeout(GOODBYE_TIMEOUT.saturating_add(GOODBYE_TIMEOUT), control).await;
+        reader.abort();
+        self.conn.close(CLOSE_NORMAL, b"");
+        let _ = timeout(Duration::from_secs(1), self.endpoint.wait_idle()).await;
+    }
+}
+
+/// Reads path statistics of a session from anywhere.
+#[derive(Debug, Clone)]
+pub struct StatsSource {
+    conn: quinn::Connection,
+}
+
+impl StatsSource {
+    /// Current path statistics.
+    #[must_use]
+    pub fn path_stats(&self) -> PathStats {
+        let stats = self.conn.stats();
+        PathStats {
+            rtt: self.conn.rtt(),
+            sent_packets: stats.path.sent_packets,
+            lost_packets: stats.path.lost_packets,
+        }
+    }
+}
+
+/// The Viewer's control loop during a session.
+async fn run_control(
+    mut writer: ControlWriter,
+    mut incoming: mpsc::Receiver<Result<ControlMsg, SessionError>>,
+    mut commands: mpsc::Receiver<ViewerCommand>,
+    events: mpsc::Sender<RemoteEvent>,
+) {
+    let ended = loop {
+        tokio::select! {
+            msg = incoming.recv() => match msg {
+                Some(Ok(ControlMsg::VideoEncoder { name })) => {
+                    let name = sanitize_device_name(&name);
+                    let _ = events.send(RemoteEvent::Encoder(name)).await;
+                }
+                Some(Ok(ControlMsg::Ping { t_us })) => {
+                    if writer.send(&ControlMsg::Pong { t_us }).await.is_err() {
+                        break None;
+                    }
+                }
+                Some(Ok(ControlMsg::Pong { .. })) => {}
+                Some(Ok(ControlMsg::Disconnect { reason })) => break Some(reason),
+                Some(Ok(_)) => {
+                    let _ = timeout(GOODBYE_TIMEOUT, writer.goodbye(DisconnectReason::ProtocolError)).await;
+                    break None;
+                }
+                Some(Err(err)) => {
+                    tracing::debug!(error = %err, "control stream ended");
+                    break None;
+                }
+                None => break None,
+            },
+            command = commands.recv() => match command {
+                Some(ViewerCommand::RequestKeyframe) => {
+                    if writer.send(&ControlMsg::RequestKeyframe).await.is_err() {
+                        break None;
+                    }
+                }
+                Some(ViewerCommand::Close) | None => {
+                    let _ = timeout(GOODBYE_TIMEOUT, writer.goodbye(DisconnectReason::Normal)).await;
+                    break None;
+                }
+            },
+        }
+    };
+    let _ = events.send(RemoteEvent::Ended(ended)).await;
 }

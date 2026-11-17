@@ -11,16 +11,21 @@ use quinn::VarInt;
 use rr_config::{KnownViewer, sanitize_device_name};
 use rr_proto::{
     BoundedString, BoundedVec, CandidateAddr, ControlMsg, DevicePublicKey, DisconnectReason,
-    Intent, MAX_DEVICE_NAME,
+    Intent, MAX_DEVICE_NAME, Permissions,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::SessionError;
-use crate::channel::{ControlChannel, disconnect_reason_for};
+use crate::channel::{ControlChannel, ControlWriter, disconnect_reason_for};
 use crate::identity::{DeviceIdentity, Fingerprint};
 use crate::pairing::{self, PairingCodes, PairingKeys, PairingUnavailable};
+use crate::session::{
+    AgentSession, Answer, CONSENT_TIMEOUT, Command, Grant, SessionEvent, SessionHandle,
+    SessionRequest,
+};
 use crate::tls::{self, MAX_PENDING_HANDSHAKES, ViewerAccess};
+use crate::video::VideoSender;
 
 /// TLS plus authentication must finish within this time (blueprint v2 §7.5).
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +37,11 @@ pub(crate) const CLOSE_REFUSED: VarInt = VarInt::from_u32(1);
 
 /// How long a goodbye may take before the connection is closed anyway.
 pub(crate) const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Keyframe requests buffered for the media side; more are coalesced.
+const EVENT_QUEUE: usize = 4;
+/// Commands buffered from the media side.
+const COMMAND_QUEUE: usize = 8;
 
 /// Source addresses allowed to reach one listener. Packets from anywhere
 /// else are dropped without an answer, before any TLS work.
@@ -70,6 +80,26 @@ pub struct AgentOptions {
     /// Where newly paired Viewers are persisted; `None` keeps them in
     /// memory only.
     pub trust_path: Option<PathBuf>,
+    /// Where screen-session requests go for the local user's consent;
+    /// `None` refuses every request.
+    pub sessions: Option<mpsc::Sender<SessionRequest>>,
+    /// How long a request waits for an answer before it is denied
+    /// ([`CONSENT_TIMEOUT`] unless testing).
+    pub consent_timeout: Duration,
+}
+
+impl AgentOptions {
+    /// Options with pairing off, nothing persisted and no sessions.
+    #[must_use]
+    pub fn new(device_name: impl Into<String>) -> Self {
+        Self {
+            device_name: device_name.into(),
+            pairing: None,
+            trust_path: None,
+            sessions: None,
+            consent_timeout: CONSENT_TIMEOUT,
+        }
+    }
 }
 
 /// A running Agent. Cheap to clone; all clones share state.
@@ -85,6 +115,8 @@ struct Shared {
     access: Arc<ViewerAccess>,
     pairing: Option<Arc<PairingCodes>>,
     trust_path: Option<PathBuf>,
+    sessions: Option<mpsc::Sender<SessionRequest>>,
+    consent_timeout: Duration,
     server_config: quinn::ServerConfig,
     handshakes: Arc<Semaphore>,
     session: Arc<Semaphore>,
@@ -115,6 +147,8 @@ impl Agent {
                 access,
                 pairing: options.pairing,
                 trust_path: options.trust_path,
+                sessions: options.sessions,
+                consent_timeout: options.consent_timeout,
                 server_config,
                 handshakes: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
                 session: Arc::new(Semaphore::new(1)),
@@ -225,16 +259,32 @@ impl Shared {
         })
         .await?;
 
-        let result = run_session(&mut ctl).await;
+        let (mut writer, reader) = ctl.split();
+        let (incoming, reader_task) = reader.spawn();
+        let mut control = Control {
+            shared: &self,
+            conn: &conn,
+            viewer: &viewer,
+            writer: &mut writer,
+            incoming,
+            state: State::Idle,
+        };
+        let result = control.run().await;
+        drop(control);
+        reader_task.abort();
         match &result {
-            Ok(()) => conn.close(CLOSE_NORMAL, b""),
+            Ok(None) => conn.close(CLOSE_NORMAL, b""),
+            Ok(Some(reason)) => {
+                let _ = timeout(GOODBYE_TIMEOUT, writer.goodbye(*reason)).await;
+                conn.close(CLOSE_NORMAL, b"");
+            }
             Err(err) => {
-                let _ = timeout(GOODBYE_TIMEOUT, ctl.goodbye(disconnect_reason_for(err))).await;
+                let _ = timeout(GOODBYE_TIMEOUT, writer.goodbye(disconnect_reason_for(err))).await;
                 conn.close(CLOSE_REFUSED, b"");
             }
         }
         tracing::info!(viewer = %viewer.name, "session ended");
-        result
+        result.map(|_| ())
     }
 
     async fn authenticate(
@@ -319,20 +369,255 @@ impl Shared {
     }
 }
 
-/// Answers pings until the Viewer leaves.
-async fn run_session(ctl: &mut ControlChannel) -> Result<(), SessionError> {
-    loop {
-        match ctl.recv().await {
-            Ok(ControlMsg::Ping { t_us }) => ctl.send(&ControlMsg::Pong { t_us }).await?,
-            Ok(ControlMsg::Pong { .. }) => {}
-            Ok(ControlMsg::Disconnect { reason }) => {
-                tracing::debug!(?reason, "viewer disconnected");
-                return Ok(());
+/// Where the control loop stands with the (single) screen session a
+/// connection may request.
+enum State {
+    /// No session requested yet.
+    Idle,
+    /// Waiting for the local user's answer.
+    Asking {
+        requested: Permissions,
+        reply: oneshot::Receiver<Answer>,
+        deadline: Instant,
+    },
+    /// Streaming.
+    Active {
+        events: mpsc::Sender<SessionEvent>,
+        commands: mpsc::Receiver<Command>,
+    },
+    /// The session ended; only pings and the goodbye remain.
+    Done,
+}
+
+/// Outcome of one control-loop step.
+enum Step {
+    Continue,
+    /// Leave the loop; `Some` sends a goodbye with this reason first.
+    Stop(Option<DisconnectReason>),
+}
+
+/// The authenticated control session of one connection.
+struct Control<'a> {
+    shared: &'a Shared,
+    conn: &'a quinn::Connection,
+    viewer: &'a Authenticated,
+    writer: &'a mut ControlWriter,
+    incoming: mpsc::Receiver<Result<ControlMsg, SessionError>>,
+    state: State,
+}
+
+impl Control<'_> {
+    /// Runs until the Viewer leaves or the session ends. `Ok(Some(reason))`
+    /// asks the caller to say goodbye with that reason.
+    async fn run(&mut self) -> Result<Option<DisconnectReason>, SessionError> {
+        loop {
+            let step = tokio::select! {
+                msg = self.incoming.recv() => self.on_message(msg).await?,
+                pending = next_pending(&mut self.state) => match pending {
+                    Pending::Answer(answer) => self.on_answer(answer).await?,
+                    Pending::Command(command) => self.on_command(command).await?,
+                },
+            };
+            if let Step::Stop(reason) = step {
+                return Ok(reason);
             }
-            Ok(_) => return Err(SessionError::Protocol("unexpected control message")),
-            Err(SessionError::Stream(_) | SessionError::Connection(_)) => return Ok(()),
-            Err(err) => return Err(err),
         }
+    }
+
+    async fn on_message(
+        &mut self,
+        msg: Option<Result<ControlMsg, SessionError>>,
+    ) -> Result<Step, SessionError> {
+        let msg = match msg {
+            None | Some(Err(SessionError::Stream(_) | SessionError::Connection(_))) => {
+                return Ok(Step::Stop(None));
+            }
+            Some(Err(err)) => return Err(err),
+            Some(Ok(msg)) => msg,
+        };
+        match msg {
+            ControlMsg::Ping { t_us } => self.writer.send(&ControlMsg::Pong { t_us }).await?,
+            ControlMsg::Pong { .. } => {}
+            ControlMsg::Disconnect { reason } => {
+                tracing::debug!(?reason, "viewer disconnected");
+                return Ok(Step::Stop(None));
+            }
+            ControlMsg::RequestSession { permissions } => {
+                if !matches!(self.state, State::Idle) {
+                    return Err(SessionError::Protocol("session already requested"));
+                }
+                self.ask(permissions).await?;
+            }
+            ControlMsg::RequestKeyframe => {
+                if let State::Active { events, .. } = &self.state {
+                    // A full queue already holds a request: coalesce.
+                    let _ = events.try_send(SessionEvent::KeyframeRequested);
+                }
+            }
+            _ => return Err(SessionError::Protocol("unexpected control message")),
+        }
+        Ok(Step::Continue)
+    }
+
+    /// Hands the request to the local user, or refuses at once if nobody
+    /// can answer.
+    async fn ask(&mut self, requested: Permissions) -> Result<(), SessionError> {
+        let denied = SessionError::Refused(DisconnectReason::ConsentDenied);
+        if !requested.contains(Permissions::VIEW) {
+            return Err(denied);
+        }
+        let sessions = self.shared.sessions.as_ref().ok_or(denied)?;
+        let (reply, receiver) = oneshot::channel();
+        let request = SessionRequest {
+            viewer_name: self.viewer.name.clone(),
+            viewer_key: self.viewer.key,
+            permissions: requested,
+            reply,
+        };
+        sessions
+            .try_send(request)
+            .map_err(|_| SessionError::Refused(DisconnectReason::ConsentDenied))?;
+        self.writer.send(&ControlMsg::ConsentPending).await?;
+        let deadline = Instant::now()
+            .checked_add(self.shared.consent_timeout)
+            .ok_or(SessionError::Timeout)?;
+        tracing::info!(viewer = %self.viewer.name, %requested, "session requested, asking the local user");
+        self.state = State::Asking {
+            requested,
+            reply: receiver,
+            deadline,
+        };
+        Ok(())
+    }
+
+    async fn on_answer(&mut self, answer: AnswerOutcome) -> Result<Step, SessionError> {
+        let State::Asking { requested, .. } = self.state else {
+            return Err(SessionError::Protocol("answer without a request"));
+        };
+        let (grant, reply) = match answer {
+            AnswerOutcome::Answered(Answer::Accept { grant, session }) => (grant, session),
+            AnswerOutcome::Answered(Answer::Deny) | AnswerOutcome::Dropped => {
+                tracing::info!(viewer = %self.viewer.name, "session denied");
+                return Err(SessionError::Refused(DisconnectReason::ConsentDenied));
+            }
+            AnswerOutcome::TimedOut => {
+                tracing::info!(viewer = %self.viewer.name, "session request timed out");
+                return Err(SessionError::Refused(DisconnectReason::ConsentTimeout));
+            }
+        };
+        let permissions = grant.permissions.intersection(requested);
+        if !permissions.contains(Permissions::VIEW) {
+            let _ = reply.send(Err(SessionError::Refused(DisconnectReason::ConsentDenied)));
+            return Err(SessionError::Refused(DisconnectReason::ConsentDenied));
+        }
+        match self.start(&grant, permissions).await {
+            Ok((session, active)) => {
+                tracing::info!(viewer = %self.viewer.name, %permissions, "session accepted");
+                self.state = active;
+                if reply.send(Ok(session)).is_err() {
+                    // The media side is gone already: nothing to stream.
+                    return Ok(Step::Stop(Some(DisconnectReason::MediaFailed)));
+                }
+                Ok(Step::Continue)
+            }
+            Err(err) => {
+                let reason = disconnect_reason_for(&err);
+                let _ = reply.send(Err(err));
+                Err(SessionError::Refused(reason))
+            }
+        }
+    }
+
+    /// Sends `SessionStart` and the encoder name, then opens the video
+    /// stream.
+    async fn start(
+        &mut self,
+        grant: &Grant,
+        permissions: Permissions,
+    ) -> Result<(AgentSession, State), SessionError> {
+        let monitors = BoundedVec::new(grant.monitors.clone())
+            .map_err(|_| SessionError::Protocol("too many monitors"))?;
+        self.writer
+            .send(&ControlMsg::SessionStart {
+                permissions,
+                monitors,
+                monitor: grant.monitor,
+            })
+            .await?;
+        self.writer
+            .send(&ControlMsg::VideoEncoder {
+                name: BoundedString::truncating(&grant.encoder),
+            })
+            .await?;
+        let video = VideoSender::new(self.conn.open_uni().await?);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+        let session = AgentSession {
+            video,
+            events: event_rx,
+            handle: SessionHandle {
+                commands: command_tx,
+            },
+            permissions,
+            viewer_name: self.viewer.name.clone(),
+        };
+        let state = State::Active {
+            events: event_tx,
+            commands: command_rx,
+        };
+        Ok((session, state))
+    }
+
+    async fn on_command(&mut self, command: Option<Command>) -> Result<Step, SessionError> {
+        match command {
+            Some(Command::Encoder(name)) => {
+                self.writer
+                    .send(&ControlMsg::VideoEncoder {
+                        name: BoundedString::truncating(&name),
+                    })
+                    .await?;
+                Ok(Step::Continue)
+            }
+            Some(Command::End(reason)) => {
+                self.state = State::Done;
+                Ok(Step::Stop(Some(reason)))
+            }
+            // Every handle was dropped: the media side stopped.
+            None => {
+                self.state = State::Done;
+                Ok(Step::Stop(Some(DisconnectReason::Normal)))
+            }
+        }
+    }
+}
+
+/// How the wait for the local user ended.
+enum AnswerOutcome {
+    Answered(Answer),
+    /// The request was dropped without an answer.
+    Dropped,
+    TimedOut,
+}
+
+/// Session-side input to the control loop.
+enum Pending {
+    Answer(AnswerOutcome),
+    Command(Option<Command>),
+}
+
+/// Resolves with the local user's answer while asking, or with the next
+/// media-side command while streaming; never otherwise.
+async fn next_pending(state: &mut State) -> Pending {
+    match state {
+        State::Asking {
+            reply, deadline, ..
+        } => Pending::Answer(match timeout_at(*deadline, reply).await {
+            Ok(Ok(answer)) => AnswerOutcome::Answered(answer),
+            Ok(Err(_)) => AnswerOutcome::Dropped,
+            Err(_) => AnswerOutcome::TimedOut,
+        }),
+        State::Active { commands, .. } => Pending::Command(commands.recv().await),
+        State::Idle | State::Done => std::future::pending().await,
     }
 }
 

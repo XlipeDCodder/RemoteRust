@@ -3,10 +3,13 @@
 //! Unprivileged process: network endpoint, protocol parsing, capture,
 //! encoding, input injection (attended mode), tray icon and consent dialog.
 //!
-//! M1 build: listeners, pairing and the control session (ping) only. There
-//! is no screen or input access yet, hence no consent prompt either: it
-//! arrives with screen sharing in M2.
+//! M2 build: listeners, pairing, the consent prompt (in the terminal) and
+//! view-only screen sharing (software H.264). Input arrives in M3; the
+//! graphical consent dialog, indicator and kill switch in M4.
 #![forbid(unsafe_code)]
+
+mod consent;
+mod media;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,9 +18,10 @@ use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand};
 use rr_config::{Config, TrustStore};
 use rr_net::{
-    Agent, AgentOptions, CodePolicy, DeviceIdentity, PairingCodes, SessionCode, plan_listeners,
+    Agent, AgentOptions, CONSENT_TIMEOUT, CodePolicy, DeviceIdentity, PairingCodes, SessionCode,
+    plan_listeners,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -141,12 +145,21 @@ async fn run(paths: &Paths, mut config: Config, args: RunArgs) -> anyhow::Result
         None
     };
 
+    // Physical pixels for capture (and, in M3, input coordinates).
+    if let Err(err) = rr_platform::capture::set_dpi_aware() {
+        tracing::debug!(error = %err, "DPI awareness not changed");
+    }
+    let (sessions, requests) = mpsc::channel(1);
+    tokio::spawn(consent::run(requests));
+
     let agent = Agent::new(
         identity,
         AgentOptions {
             device_name,
             pairing,
             trust_path: Some(paths.trust.clone()),
+            sessions: Some(sessions),
+            consent_timeout: CONSENT_TIMEOUT,
         },
         trust.viewers.iter().map(|viewer| viewer.key),
     )?;

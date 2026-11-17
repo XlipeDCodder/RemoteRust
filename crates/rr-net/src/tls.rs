@@ -272,16 +272,39 @@ impl ClientCertVerifier for ViewerCertVerifier {
     }
 }
 
-/// QUIC transport parameters shared by both roles.
-fn transport_config() -> Arc<TransportConfig> {
+/// Unacknowledged data the Agent may buffer across all streams. QUIC
+/// buffers writes until this is full, so it bounds how stale a queued video
+/// frame can get when the path is slower than the encoder: the video
+/// writer blocks, and the Agent skips capturing ("latest frame wins",
+/// blueprint v2 §6.2). 256 KiB is about 200 ms at 10 Mbit/s, and still
+/// allows 20 Mbit/s at 100 ms RTT.
+const AGENT_SEND_WINDOW: u64 = 256 * 1024;
+
+/// Streams the *peer* may open, per role (QUIC limits are set by the
+/// receiver; blueprint v2 §6.2).
+#[derive(Debug, Clone, Copy)]
+struct StreamLimits {
+    bidi: u32,
+    uni: u32,
+}
+
+/// The Viewer opens the control stream only (input arrives in M3).
+const VIEWER_OPENS: StreamLimits = StreamLimits { bidi: 1, uni: 0 };
+/// The Agent opens the video stream only (cursor arrives in M3).
+const AGENT_OPENS: StreamLimits = StreamLimits { bidi: 0, uni: 1 };
+
+/// QUIC transport parameters; `peer` limits what the other side may open.
+fn transport_config(peer: StreamLimits, send_window: Option<u64>) -> Arc<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport
         .keep_alive_interval(Some(KEEP_ALIVE))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
-        // M1 only needs the control stream. Media streams (M2) raise these.
-        .max_concurrent_bidi_streams(VarInt::from_u32(1))
-        .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .max_concurrent_bidi_streams(VarInt::from_u32(peer.bidi))
+        .max_concurrent_uni_streams(VarInt::from_u32(peer.uni))
         .datagram_receive_buffer_size(None);
+    if let Some(window) = send_window {
+        transport.send_window(window);
+    }
     Arc::new(transport)
 }
 
@@ -309,7 +332,7 @@ pub(crate) fn server_config(
     let crypto = QuicServerConfig::try_from(tls).map_err(|_| SessionError::NoInitialCipherSuite)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config
-        .transport_config(transport_config())
+        .transport_config(transport_config(VIEWER_OPENS, Some(AGENT_SEND_WINDOW)))
         .max_incoming(MAX_PENDING_HANDSHAKES);
     Ok(config)
 }
@@ -335,7 +358,7 @@ pub(crate) fn client_config(
 
     let crypto = QuicClientConfig::try_from(tls).map_err(|_| SessionError::NoInitialCipherSuite)?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(transport_config());
+    config.transport_config(transport_config(AGENT_OPENS, None));
     Ok(config)
 }
 

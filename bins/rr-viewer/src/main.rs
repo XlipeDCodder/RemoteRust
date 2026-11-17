@@ -4,8 +4,14 @@
 //! Unprivileged process: UI, path selection, decoding, rendering and local
 //! input capture.
 //!
-//! M1 build: pairing, path selection and the control session (ping) only.
+//! M2 build: pairing, path selection and view-only screen sessions in a
+//! window (software H.264, wgpu presentation, F1 statistics overlay).
 #![forbid(unsafe_code)]
+
+mod overlay;
+mod render;
+mod video;
+mod window;
 
 use std::io::{BufRead as _, Write as _};
 use std::net::{IpAddr, SocketAddr};
@@ -15,7 +21,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use rr_config::{AgentConfig, Config, KnownAgent, MAX_KNOWN_ADDRESSES, TrustStore};
-use rr_net::{DeviceIdentity, Fingerprint, RaceError, SessionCode, SessionError, Viewer};
+use rr_net::{
+    CONSENT_TIMEOUT, DeviceIdentity, Fingerprint, RaceError, SessionCode, SessionError, Viewer,
+    ViewerSession,
+};
+use rr_proto::{DisconnectReason, Permissions};
+use tokio::runtime::Runtime;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,13 +55,24 @@ enum Command {
         #[arg(long)]
         code: Option<String>,
     },
-    /// Connect to a paired Agent over the best available path.
+    /// View a paired Agent's screen in a window (its user must accept).
     Connect {
+        /// Agent name or key prefix (8+ hex characters).
+        agent: String,
+        /// Open the window on this local display (0 is the first one).
+        #[arg(long, value_name = "INDEX")]
+        display: Option<usize>,
+        /// Start in full screen (F11 toggles it).
+        #[arg(long)]
+        fullscreen: bool,
+    },
+    /// Measure the round trip to a paired Agent over the best path.
+    Ping {
         /// Agent name or key prefix (8+ hex characters).
         agent: String,
         /// Number of pings to send before disconnecting.
         #[arg(long, default_value_t = 5)]
-        pings: u32,
+        count: u32,
     },
     /// List paired Agents and their known addresses.
     List,
@@ -90,17 +112,37 @@ impl Paths {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     rr_telemetry::init()?;
     let cli = Cli::parse();
     let paths = Paths::resolve(cli.data_dir)?;
     let config = rr_config::load_or_default(&paths.config)
         .with_context(|| format!("cannot load {}", paths.config.display()))?;
+    // The window must own the main thread (macOS requires it), so the
+    // network runs on a runtime built here rather than in `main`.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("rr-net")
+        .build()
+        .context("cannot start the async runtime")?;
 
     match cli.command {
-        Command::Pair { address, code } => pair(&paths, &config, &address, code).await,
-        Command::Connect { agent, pings } => connect(&paths, &config, &agent, pings).await,
+        Command::Pair { address, code } => runtime.block_on(pair(&paths, &config, &address, code)),
+        Command::Connect {
+            agent,
+            display,
+            fullscreen,
+        } => connect(
+            &runtime,
+            &paths,
+            &config,
+            &agent,
+            window::Options {
+                display,
+                fullscreen,
+            },
+        ),
+        Command::Ping { agent, count } => runtime.block_on(ping(&paths, &config, &agent, count)),
         Command::List => list(&paths),
         Command::Forget { agent } => forget(&paths, &agent),
         Command::Interfaces => {
@@ -148,13 +190,19 @@ async fn pair(
     Ok(())
 }
 
-async fn connect(paths: &Paths, config: &Config, query: &str, pings: u32) -> anyhow::Result<()> {
+/// Connects to a paired Agent over the best path and refreshes its
+/// addresses. Returns the session and a label for the path used.
+async fn open_session(
+    paths: &Paths,
+    config: &Config,
+    query: &str,
+) -> anyhow::Result<(ViewerSession, String)> {
     let trust = load_trust(paths)?;
     let agent = find_agent(&trust, query)?.clone();
     let viewer = new_viewer(paths, config)?;
     let stagger = Duration::from_millis(u64::from(config.viewer.race_stagger_ms));
 
-    let mut session = match viewer
+    let session = match viewer
         .connect_known(&agent, &config.viewer.network_priority, stagger)
         .await
     {
@@ -175,10 +223,8 @@ async fn connect(paths: &Paths, config: &Config, query: &str, pings: u32) -> any
         .iter()
         .find(|candidate| candidate.addr == used)
         .map_or("?", |candidate| candidate.class.as_str());
-    println!(
-        "Connected to \"{}\" via {used} ({class})",
-        session.agent_name()
-    );
+    let path = format!("{used} ({class})");
+    println!("Connected to \"{}\" via {path}", session.agent_name());
 
     // Refresh the address book with what the Agent announces now, keeping
     // older entries (such as manual addresses) after them.
@@ -192,8 +238,76 @@ async fn connect(paths: &Paths, config: &Config, query: &str, pings: u32) -> any
     if let Err(err) = update_trust(paths, |trust| trust.upsert_agent(refreshed.clone())) {
         eprintln!("warning: could not update the address book: {err:#}");
     }
+    Ok((session, path))
+}
 
-    for n in 0..pings {
+fn connect(
+    runtime: &Runtime,
+    paths: &Paths,
+    config: &Config,
+    query: &str,
+    options: window::Options,
+) -> anyhow::Result<()> {
+    let (session, path) = runtime.block_on(open_session(paths, config, query))?;
+    println!(
+        "Waiting for the person at \"{}\" to accept (up to {} s)...",
+        session.agent_name(),
+        CONSENT_TIMEOUT.as_secs()
+    );
+    let remote = match runtime.block_on(session.start(Permissions::VIEW)) {
+        Ok(remote) => remote,
+        Err(SessionError::Closed(reason)) => bail!("{}", describe(reason)),
+        Err(err) => return Err(explain(err)).context("the screen session did not start"),
+    };
+    let grant = remote.grant();
+    println!("Session started ({}).", grant.permissions);
+    for monitor in &grant.monitors {
+        let marker = if monitor.id == grant.monitor {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "  {marker} monitor {}: {} {}x{}",
+            monitor.id, monitor.name, monitor.width, monitor.height
+        );
+    }
+    println!("Press F1 in the window for statistics, F11 for full screen.");
+
+    let (outcome, summary) = window::run(runtime, remote, path, options)?;
+    match outcome {
+        window::Outcome::Closed => println!("Session closed."),
+        window::Outcome::Ended(Some(reason)) => println!("Session ended: {}.", describe(reason)),
+        window::Outcome::Ended(None) => println!("Session ended: the connection closed."),
+        window::Outcome::Failed(error) => {
+            println!("{summary}");
+            bail!("the session failed: {error}");
+        }
+    }
+    println!("{summary}");
+    Ok(())
+}
+
+/// A sentence for a reason the Agent gave.
+const fn describe(reason: DisconnectReason) -> &'static str {
+    match reason {
+        DisconnectReason::Normal => "the Agent ended the session",
+        DisconnectReason::NotPaired => "this device is not paired with the Agent",
+        DisconnectReason::PairingUnavailable => "the Agent is not accepting pairing",
+        DisconnectReason::PairingFailed => "pairing failed",
+        DisconnectReason::Busy => "the Agent is busy with another session",
+        DisconnectReason::ProtocolError => "protocol error",
+        DisconnectReason::Timeout => "the connection timed out",
+        DisconnectReason::ShuttingDown => "the Agent is shutting down",
+        DisconnectReason::ConsentDenied => "the person at the Agent denied the session",
+        DisconnectReason::ConsentTimeout => "nobody at the Agent answered in time",
+        DisconnectReason::MediaFailed => "the Agent could not capture or encode the screen",
+    }
+}
+
+async fn ping(paths: &Paths, config: &Config, query: &str, count: u32) -> anyhow::Result<()> {
+    let (mut session, _) = open_session(paths, config, query).await?;
+    for n in 0..count {
         if n > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates (add an entry here when a crate gains its first dependent)
 rr-config = { path = "crates/rr-config" }
+rr-media = { path = "crates/rr-media" }
 rr-net = { path = "crates/rr-net" }
 rr-platform = { path = "crates/rr-platform" }
 rr-proto = { path = "crates/rr-proto" }
@@ -22,8 +23,16 @@ rr-telemetry = { path = "crates/rr-telemetry" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
+# Viewer UI (blueprint v2 §8.6). Default features off: no clipboard access and
+# no link opening (the Viewer never opens anything it receives, §7.7).
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", default-features = false, features = ["winit"] }
+egui-winit = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
 ipnet = { version = "2", features = ["serde"] }
 netdev = { version = "0.47", default-features = false }
+# Software H.264 (BSD-2-Clause), built from source: the fallback codec (§8.4).
+openh264 = "0.9"
+pollster = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 proptest = "1"
 # QUIC + TLS 1.3 with the `ring` provider only (no aws-lc build requirements,
@@ -42,7 +51,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Certificate parsing: the same parser rustls itself uses.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# Native backends only (no WebGPU/WebGL): D3D12 on Windows, Vulkan or GL on
+# Linux, Metal on macOS.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12", "vulkan", "gles", "metal"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security_Cryptography",
+    "Win32_UI_HiDpi",
+] }
+# Default features except Wayland title text: drawing it pulls a font parser
+# (ab_glyph → ttf-parser, unmaintained: RUSTSEC-2026-0192). Windows and X11
+# are unaffected; on GNOME/Wayland the title bar is drawn without its text.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
 zeroize = "1"
 
 [workspace.lints.rust]
@@ -52,6 +77,9 @@ unsafe_code = "deny"
 missing_docs = "warn"
 unused_qualifications = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
+# MSVC's LNK4255 about OpenH264's same-named object files (dct.o in several
+# source folders) is harmless and would otherwise show on every link.
+linker_messages = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

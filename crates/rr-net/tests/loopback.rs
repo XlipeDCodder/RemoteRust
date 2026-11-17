@@ -49,9 +49,9 @@ fn start_agent_with(
     let key = identity.public_key();
     let codes = pairing.then(|| PairingCodes::new(test_policy()).unwrap());
     let options = AgentOptions {
-        device_name: "test-agent".to_owned(),
         pairing: codes.clone(),
         trust_path,
+        ..AgentOptions::new("test-agent")
     };
     let agent = Agent::new(identity, options, known.iter().copied()).unwrap();
     let endpoint = agent.bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -302,9 +302,8 @@ async fn listener_set_announces_addresses_and_the_race_finds_a_path() {
     let agent = Agent::new(
         identity,
         AgentOptions {
-            device_name: "listener-agent".to_owned(),
             pairing: Some(Arc::clone(&codes)),
-            trust_path: None,
+            ..AgentOptions::new("listener-agent")
         },
         [],
     )

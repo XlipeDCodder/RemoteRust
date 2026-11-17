@@ -1,7 +1,7 @@
 name: Fuzz
 
 # Coverage-guided fuzzing of the wire-protocol decoders (blueprint v2 §6.3).
-# M1 acceptance: `control_msg` runs for 1 h without findings.
+# Acceptance: every target runs for 1 h without findings.
 on:
   schedule:
     - cron: "17 3 * * 1" # weekly, Monday 03:17 UTC
@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [control_msg]
+        target: [control_msg, video_header]
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly and cargo-fuzz

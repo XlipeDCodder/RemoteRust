@@ -10,10 +10,12 @@ publish.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rr-config.workspace = true
+rr-media.workspace = true
 rr-net.workspace = true
 rr-platform.workspace = true
 rr-proto.workspace = true
 rr-telemetry.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

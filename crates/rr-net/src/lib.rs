@@ -27,15 +27,25 @@ pub mod identity;
 pub mod listen;
 pub mod pairing;
 pub mod race;
+pub mod session;
 mod tls;
+pub mod video;
 pub mod viewer;
 
 pub use agent::{Agent, AgentOptions, SourceFilter};
+pub use channel::monotonic_us;
 pub use discovery::{LocalInterface, discover};
 pub use error::SessionError;
 pub use identity::{DeviceIdentity, Fingerprint, IdentityError, default_identity_path};
 pub use listen::{ListenPlan, ListenTarget, ListenerSet, plan_listeners, run_listeners};
 pub use pairing::{CodePolicy, PairingCodes, SessionCode};
 pub use race::RaceError;
+pub use session::{
+    AgentSession, CONSENT_TIMEOUT, Grant, SessionEvent, SessionHandle, SessionRequest,
+};
 pub use tls::ViewerAccess;
-pub use viewer::{Viewer, ViewerSession};
+pub use video::{VideoReceiver, VideoSender};
+pub use viewer::{
+    PathStats, RemoteEvent, RemoteSession, SessionControl, SessionGrant, StatsSource, Viewer,
+    ViewerSession,
+};

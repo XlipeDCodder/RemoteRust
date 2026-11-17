@@ -27,6 +27,9 @@ pub enum FrameError {
     /// Bytes remained after a complete message.
     #[error("{0} unexpected trailing bytes")]
     TrailingBytes(usize),
+    /// The message decoded but a field is out of range.
+    #[error("invalid field: {0}")]
+    Invalid(&'static str),
 }
 
 /// Encodes `msg` as a complete frame (prefix + body).
@@ -92,7 +95,7 @@ mod tests {
     use super::*;
     use crate::{
         BoundedBytes, BoundedString, BoundedVec, CandidateAddr, ControlMsg, DisconnectReason,
-        Intent, NetworkClass, limits,
+        Intent, MonitorInfo, NetworkClass, Permissions, limits,
     };
 
     fn split(frame: &[u8]) -> ([u8; PREFIX_LEN], &[u8]) {
@@ -126,7 +129,47 @@ mod tests {
             ControlMsg::Disconnect {
                 reason: DisconnectReason::PairingFailed,
             },
+            ControlMsg::RequestSession {
+                permissions: Permissions::VIEW.union(Permissions::CONTROL),
+            },
+            ControlMsg::ConsentPending,
+            ControlMsg::SessionStart {
+                permissions: Permissions::VIEW,
+                monitors: BoundedVec::new(vec![MonitorInfo {
+                    id: 0,
+                    name: BoundedString::new("DISPLAY1").unwrap(),
+                    width: 1920,
+                    height: 1080,
+                    primary: true,
+                }])
+                .unwrap(),
+                monitor: 0,
+            },
+            ControlMsg::RequestKeyframe,
+            ControlMsg::VideoEncoder {
+                name: BoundedString::new("openh264 (software)").unwrap(),
+            },
+            ControlMsg::Disconnect {
+                reason: DisconnectReason::ConsentTimeout,
+            },
         ]
+    }
+
+    #[test]
+    fn largest_session_start_fits_the_control_limit() {
+        let monitor = MonitorInfo {
+            id: u8::MAX,
+            name: BoundedString::new("x".repeat(crate::session::MAX_MONITOR_NAME)).unwrap(),
+            width: u16::MAX,
+            height: u16::MAX,
+            primary: true,
+        };
+        let msg = ControlMsg::SessionStart {
+            permissions: Permissions::VIEW,
+            monitors: BoundedVec::new(vec![monitor; crate::session::MAX_MONITORS]).unwrap(),
+            monitor: 0,
+        };
+        assert!(encode(&msg, limits::CONTROL).is_ok());
     }
 
     #[test]

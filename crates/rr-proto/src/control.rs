@@ -13,13 +13,30 @@
 //!                       ◄───────────────── PairingConfirm (agent MAC)
 //!   -- both intents --
 //!                       ◄───────────────── SessionReady, AgentAddresses
+//!   -- optional: screen session (at most once per connection) --
+//!   RequestSession{permissions} ─────────►
+//!                       ◄───────────────── ConsentPending
+//!                                           (local user: Accept / Deny,
+//!                                            auto-deny after 30 s)
+//!                       ◄───────────────── SessionStart  or  Disconnect
+//!                       ◄───────────────── VideoEncoder{name}
+//!                       ◄═════════════════ video stream (unidirectional)
+//!   RequestKeyframe ─────────────────────►
+//!   -- any time --
 //!   Ping / Pong (either direction) ◄─────►
 //!   Disconnect (either direction) ───────►
 //! ```
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BoundedBytes, BoundedString, BoundedVec, CandidateAddr, MAX_DEVICE_NAME};
+use crate::session::MAX_MONITORS;
+use crate::{
+    BoundedBytes, BoundedString, BoundedVec, CandidateAddr, MAX_DEVICE_NAME, MonitorInfo,
+    Permissions,
+};
+
+/// Maximum length of an encoder name, in bytes.
+pub const MAX_ENCODER_NAME: usize = 48;
 
 /// What the Viewer wants from this connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +66,12 @@ pub enum DisconnectReason {
     Timeout,
     /// The Agent is shutting down.
     ShuttingDown,
+    /// The local user at the Agent denied the session.
+    ConsentDenied,
+    /// Nobody answered the consent prompt in time.
+    ConsentTimeout,
+    /// The Agent could not capture or encode the screen.
+    MediaFailed,
 }
 
 /// A message on the control stream.
@@ -97,5 +120,28 @@ pub enum ControlMsg {
     Disconnect {
         /// Why.
         reason: DisconnectReason,
+    },
+    /// The Viewer asks for a screen session; the Agent asks its local user.
+    RequestSession {
+        /// What the Viewer wants to do.
+        permissions: Permissions,
+    },
+    /// The Agent is waiting for its local user to accept.
+    ConsentPending,
+    /// The local user accepted; the video stream follows.
+    SessionStart {
+        /// Granted permissions (never more than requested).
+        permissions: Permissions,
+        /// The Agent's monitors.
+        monitors: BoundedVec<MonitorInfo, MAX_MONITORS>,
+        /// The monitor being streamed (a `MonitorInfo::id`).
+        monitor: u8,
+    },
+    /// The Viewer cannot decode: send a frame that needs no earlier frame.
+    RequestKeyframe,
+    /// The encoder now in use, for the Viewer overlay.
+    VideoEncoder {
+        /// Human-readable encoder name.
+        name: BoundedString<MAX_ENCODER_NAME>,
     },
 }
