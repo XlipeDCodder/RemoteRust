@@ -33,6 +33,9 @@ egui-wgpu = { version = "0.37", default-features = false, features = ["winit"] }
 egui-winit = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
 ipnet = { version = "2", features = ["serde"] }
 netdev = { version = "0.47", default-features = false }
+# Turns on ANSI colors in a Windows console for the logs; already pulled in
+# by tracing-subscriber.
+nu-ansi-term = "0.50"
 # Software H.264 (BSD-2-Clause), built from source: the fallback codec (§8.4).
 openh264 = "0.9"
 # PipeWire client for portal screen casts; links libpipewire-0.3 (MIT), so

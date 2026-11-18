@@ -49,7 +49,7 @@ pub fn init() -> Result<(), TelemetryError> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(std::io::stderr().is_terminal() && ansi_supported())
         .try_init()
         .map_err(|_| TelemetryError::AlreadyInitialized)?;
 
@@ -57,6 +57,19 @@ pub fn init() -> Result<(), TelemetryError> {
         tracing::warn!(%err, "invalid {LOG_ENV_VAR} value; using `{DEFAULT_FILTER}`");
     }
     Ok(())
+}
+
+/// Whether the console shows ANSI colors. An older Windows console prints
+/// the codes as text (`←[2m`) until virtual-terminal processing is turned
+/// on; if that fails the logs go out without colors.
+#[cfg(windows)]
+fn ansi_supported() -> bool {
+    nu_ansi_term::enable_ansi_support().is_ok()
+}
+
+#[cfg(not(windows))]
+fn ansi_supported() -> bool {
+    true
 }
 
 #[cfg(test)]

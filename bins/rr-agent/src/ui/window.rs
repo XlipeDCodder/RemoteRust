@@ -162,6 +162,25 @@ fn header(ui: &mut egui::Ui, hub: &Hub) {
     });
 }
 
+/// A heading after a status dot: filled with `dot`'s color, or a ring when
+/// `None`. The dot is drawn because egui's built-in fonts have no ● or ○.
+fn status_heading(ui: &mut egui::Ui, text: RichText, dot: Option<Color32>) {
+    ui.horizontal(|ui| {
+        let side = 12.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        let center = rect.center();
+        match dot {
+            Some(color) => ui.painter().circle_filled(center, side / 2.0 - 1.0, color),
+            None => ui.painter().circle_stroke(
+                center,
+                side / 2.0 - 1.5,
+                egui::Stroke::new(1.5, ui.visuals().text_color()),
+            ),
+        };
+        ui.add(egui::Label::new(text).wrap());
+    });
+}
+
 /// The session, the request or the code; `true` if Stop was clicked.
 fn session(ui: &mut egui::Ui, snapshot: &Snapshot, hub: &Hub) -> bool {
     ui.add_space(4.0);
@@ -171,11 +190,13 @@ fn session(ui: &mut egui::Ui, snapshot: &Snapshot, hub: &Hub) -> bool {
         } else {
             "view only"
         };
-        ui.label(
-            RichText::new(format!("● Sharing this screen with \"{}\"", live.viewer))
+        status_heading(
+            ui,
+            RichText::new(format!("Sharing this screen with \"{}\"", live.viewer))
                 .color(RED)
                 .strong()
                 .size(17.0),
+            Some(RED),
         );
         ui.label(format!("{what}, for {}", clock(live.elapsed)));
         ui.label(
@@ -207,7 +228,7 @@ fn session(ui: &mut egui::Ui, snapshot: &Snapshot, hub: &Hub) -> bool {
         ui.label(RichText::new(format!("\"{viewer}\" is asking to connect…")).strong());
         return false;
     }
-    ui.label(RichText::new("○ Not sharing").strong().size(17.0));
+    status_heading(ui, RichText::new("Not sharing").strong().size(17.0), None);
     match &snapshot.code {
         Some((code, left)) => {
             ui.add_space(6.0);
