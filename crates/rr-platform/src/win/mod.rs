@@ -3,8 +3,10 @@
 //!
 //! Named `win` (not `windows`) so it never clashes with the `windows` crate.
 
+pub(crate) mod border;
 pub(crate) mod capture;
 pub(crate) mod cursor;
+pub(crate) mod desktop;
 pub(crate) mod dpapi;
 pub(crate) mod dpi;
 pub(crate) mod hook;

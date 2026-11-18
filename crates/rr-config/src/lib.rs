@@ -24,9 +24,9 @@ mod trust;
 pub use error::ConfigError;
 pub use files::{default_data_dir, read_limited, write_atomic, write_new};
 pub use model::{
-    AgentConfig, AttendedConfig, Config, MAX_ALLOWED_SOURCES, MAX_DEVICE_NAME_LEN,
-    MAX_MANUAL_LISTEN, NetworkClass, NetworkPolicies, NetworkPolicy, ViewerConfig,
-    sanitize_device_name,
+    AgentConfig, AttendedConfig, Config, KillSwitchConfig, MAX_ALLOWED_SOURCES,
+    MAX_DEVICE_NAME_LEN, MAX_MANUAL_LISTEN, NetworkClass, NetworkPolicies, NetworkPolicy,
+    ViewerConfig, sanitize_device_name,
 };
 pub use store::{
     CONFIG_FILE_NAME, MAX_CONFIG_FILE_SIZE, default_config_path, load, load_or_default, save,

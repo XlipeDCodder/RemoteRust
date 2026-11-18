@@ -94,8 +94,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        BoundedBytes, BoundedString, BoundedVec, CandidateAddr, ControlMsg, DisconnectReason,
-        Intent, MonitorInfo, NetworkClass, Permissions, limits,
+        BoundedBytes, BoundedString, BoundedVec, CandidateAddr, ControlMsg, DesktopState,
+        DisconnectReason, Intent, MonitorInfo, NetworkClass, Permissions, limits,
     };
 
     fn split(frame: &[u8]) -> ([u8; PREFIX_LEN], &[u8]) {
@@ -151,6 +151,18 @@ mod tests {
             },
             ControlMsg::Disconnect {
                 reason: DisconnectReason::ConsentTimeout,
+            },
+            ControlMsg::DesktopState {
+                state: DesktopState::SecureDesktop,
+            },
+            ControlMsg::DesktopState {
+                state: DesktopState::Normal,
+            },
+            ControlMsg::Disconnect {
+                reason: DisconnectReason::StoppedLocally,
+            },
+            ControlMsg::Disconnect {
+                reason: DisconnectReason::RateLimited,
             },
         ]
     }
@@ -216,6 +228,19 @@ mod tests {
     fn unknown_variant_is_rejected() {
         assert!(decode::<ControlMsg>(&[0x7F]).is_err());
         assert!(decode::<ControlMsg>(&[]).is_err());
+    }
+
+    #[test]
+    fn unknown_desktop_state_is_rejected() {
+        let msg = ControlMsg::DesktopState {
+            state: DesktopState::SecureDesktop,
+        };
+        let frame = encode(&msg, limits::CONTROL).unwrap();
+        let (_, body) = split(&frame);
+        // The state is the last byte; past the known states nothing decodes.
+        let mut unknown = body.to_vec();
+        *unknown.last_mut().unwrap() = 2;
+        assert!(decode::<ControlMsg>(&unknown).is_err());
     }
 
     proptest! {

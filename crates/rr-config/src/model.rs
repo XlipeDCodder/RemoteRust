@@ -101,6 +101,8 @@ pub struct AgentConfig {
     pub networks: NetworkPolicies,
     /// Attended-session parameters.
     pub attended: AttendedConfig,
+    /// The hotkey that ends every session at once.
+    pub kill_switch: KillSwitchConfig,
 }
 
 impl AgentConfig {
@@ -115,7 +117,8 @@ impl AgentConfig {
             self.networks.get(class).validate(class)?;
         }
         self.validate_manual_listen()?;
-        self.attended.validate()
+        self.attended.validate()?;
+        self.kill_switch.validate()
     }
 
     fn validate_manual_listen(&self) -> Result<(), ConfigError> {
@@ -157,6 +160,47 @@ impl Default for AgentConfig {
             manual_listen: Vec::new(),
             networks: NetworkPolicies::default(),
             attended: AttendedConfig::default(),
+            kill_switch: KillSwitchConfig::default(),
+        }
+    }
+}
+
+/// The kill switch (blueprint v2 §7.6): a hotkey on the Agent's own
+/// keyboard, physical keys only, that ends every session at once. The tray
+/// and window buttons always work too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KillSwitchConfig {
+    /// Modifiers and one key joined by `+`, e.g. `Ctrl+Alt+Shift+F12`
+    /// (W3C key names: `F12`, `KeyK` or `K`, `Digit1` or `1`, `Pause`).
+    /// The Agent checks the key names when it starts.
+    pub hotkey: String,
+}
+
+impl KillSwitchConfig {
+    /// The default hotkey.
+    pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+Shift+F12";
+    const MAX_HOTKEY_LEN: usize = 64;
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        const FIELD: &str = "agent.kill_switch.hotkey";
+        if !self.hotkey.contains('+') {
+            return Err(invalid(
+                FIELD,
+                "needs at least one modifier and a key, e.g. \"Ctrl+Alt+Shift+F12\"",
+            ));
+        }
+        if self.hotkey.len() > Self::MAX_HOTKEY_LEN || !self.hotkey.is_ascii() {
+            return Err(invalid(FIELD, "must be at most 64 ASCII characters"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for KillSwitchConfig {
+    fn default() -> Self {
+        Self {
+            hotkey: Self::DEFAULT_HOTKEY.to_owned(),
         }
     }
 }
@@ -631,6 +675,25 @@ mod tests {
         assert_invalid(
             "[agent.attended]\ncode_ttl_secs = 7200\n",
             "agent.attended.code_ttl_secs",
+        );
+    }
+
+    #[test]
+    fn kill_switch_hotkey_rules() {
+        assert_eq!(
+            Config::default().agent.kill_switch.hotkey,
+            "Ctrl+Alt+Shift+F12"
+        );
+        let config: Config =
+            toml::from_str("[agent.kill_switch]\nhotkey = \"Ctrl+Shift+K\"\n").unwrap();
+        config.validate().unwrap();
+        assert_invalid(
+            "[agent.kill_switch]\nhotkey = \"F12\"\n",
+            "agent.kill_switch.hotkey",
+        );
+        assert_invalid(
+            "[agent.kill_switch]\nhotkey = \"Ctrl+Ç\"\n",
+            "agent.kill_switch.hotkey",
         );
     }
 

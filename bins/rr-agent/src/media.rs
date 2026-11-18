@@ -11,19 +11,27 @@
 //! network has taken the previous frame (a one-permit semaphore). While it
 //! waits, DXGI folds screen updates together, so the next frame always
 //! shows the current screen and nothing ever queues.
+//!
+//! The capture thread also shows the session border around the shared
+//! monitor and notices the secure desktop (blueprint v2 §7.3, §7.5): while
+//! a UAC prompt or the lock screen shows, the Viewer is told so, its input
+//! is dropped, and a keyframe follows the user's desktop when it is back.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rr_media::{EncoderSettings, I420, OpenH264Encoder, VideoEncoder, bgra_to_i420};
-use rr_net::{AgentSession, SessionEvent, monotonic_us};
+use rr_net::{AgentSession, SessionEvent, SessionHandle, monotonic_us};
+use rr_platform::border::{Border, BorderError};
 use rr_platform::capture::{self, CaptureError, Screen};
+use rr_platform::desktop::{InputDesktop, input_desktop};
 use rr_platform::input::{Area, InputBackend, InputError};
-use rr_proto::{AgentTimings, Codec, CursorMsg, DisconnectReason, VideoFrameHeader};
+use rr_proto::{AgentTimings, Codec, CursorMsg, DesktopState, DisconnectReason, VideoFrameHeader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::cursor::{self, CursorThread};
+use crate::hub::Hub;
 use crate::input::{self, InputThread, Queue};
 
 /// Frame rate cap for the software path (blueprint v2 §2.3: ≥ 30 fps).
@@ -55,8 +63,14 @@ struct Flags {
     stop: AtomicBool,
 }
 
-/// Streams monitor `monitor` until the session ends.
-pub async fn run_session(mut session: AgentSession, monitor: u8) {
+/// Streams monitor `monitor` until the session ends. `fingerprint` is the
+/// Viewer's, for the window.
+pub async fn run_session(
+    mut session: AgentSession,
+    monitor: u8,
+    hub: Arc<Hub>,
+    fingerprint: String,
+) {
     let handle = session.handle();
     let viewer = session.viewer_name().to_owned();
     let flags = Arc::new(Flags {
@@ -79,6 +93,13 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
     let cursor_task = session
         .take_cursor()
         .map(|sender| tokio::spawn(cursor::send(sender, cursor_rx)));
+    let live = hub.session_started(
+        &viewer,
+        fingerprint,
+        session.permissions(),
+        handle.clone(),
+        control.as_ref().map(|(queue, _)| Arc::clone(queue)),
+    );
 
     let pipeline = Pipeline {
         monitor,
@@ -89,6 +110,9 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
         runtime: tokio::runtime::Handle::current(),
         input: control.as_ref().map(|(queue, _)| Arc::clone(queue)),
         cursor: cursor_tx,
+        handle: handle.clone(),
+        hub: Arc::clone(&hub),
+        live,
     };
     let thread = std::thread::Builder::new()
         .name("rr-capture".to_owned())
@@ -98,6 +122,7 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
         Err(err) => {
             tracing::error!(error = %err, "cannot start the capture thread");
             handle.end(DisconnectReason::MediaFailed);
+            hub.session_ended(live);
             return;
         }
     };
@@ -148,6 +173,7 @@ pub async fn run_session(mut session: AgentSession, monitor: u8) {
             handle.end(DisconnectReason::MediaFailed);
         }
     }
+    hub.session_ended(live);
     tracing::info!(%viewer, "screen sharing stopped");
 }
 
@@ -163,6 +189,11 @@ struct Pipeline {
     input: Option<Arc<Queue>>,
     /// Pointer updates for the Viewer.
     cursor: mpsc::Sender<CursorMsg>,
+    /// Tells the Viewer about the secure desktop.
+    handle: SessionHandle,
+    hub: Arc<Hub>,
+    /// This session in the hub.
+    live: u64,
 }
 
 /// Why the capture thread stopped with an error.
@@ -209,10 +240,14 @@ impl Pipeline {
         let _cursor = CursorThread::start(area.clone(), self.cursor.clone())
             .inspect_err(|err| tracing::warn!(error = %err, "cannot start the cursor thread"))
             .ok();
+        let mut border = self.show_border(&area);
         let mut encoder = OpenH264Encoder::new(&EncoderSettings {
             max_fps: MAX_FPS,
             ..EncoderSettings::default()
         })?;
+        // The secure desktop is showing: the Viewer was told, input is
+        // suspended.
+        let mut secure = false;
         let interval = Duration::from_secs(1) / u32::from(MAX_FPS);
         let mut picture = I420::default();
         let mut have_picture = false;
@@ -268,7 +303,11 @@ impl Pipeline {
                 folded = folded.saturating_add(frame.accumulated.saturating_sub(1));
             });
             // The monitor may have moved or changed resolution.
-            area.set(Area::of(capturer.monitor()));
+            let current = Area::of(capturer.monitor());
+            area.set(current);
+            if let (Some(border), Some(current)) = (&mut border, current) {
+                border.follow(current);
+            }
             match captured {
                 Ok(true) => {
                     converted?;
@@ -277,11 +316,23 @@ impl Pipeline {
                 }
                 Ok(false) => {}
                 Err(CaptureError::AccessLost) => {
-                    tracing::debug!("capture interrupted, retrying");
+                    if !secure && input_desktop() == InputDesktop::Secure {
+                        secure = true;
+                        self.set_secure(true);
+                    } else {
+                        tracing::debug!("capture interrupted, retrying");
+                    }
                     std::thread::sleep(ACCESS_LOST_RETRY);
                     continue;
                 }
                 Err(err) => return Err(err.into()),
+            }
+            if secure && input_desktop() == InputDesktop::Normal {
+                secure = false;
+                self.set_secure(false);
+                // The Viewer's picture is stale: start over from a keyframe.
+                keyframe_pending = true;
+                last_keyframe = None;
             }
 
             if self.flags.keyframe.swap(false, Ordering::Relaxed) {
@@ -339,6 +390,41 @@ impl Pipeline {
 }
 
 impl Pipeline {
+    /// Shows the session border around the shared monitor, where this
+    /// system allows it.
+    fn show_border(&self, area: &rr_platform::input::SharedArea) -> Option<Border> {
+        match Border::show(area.get()?) {
+            Ok(border) => Some(border),
+            Err(BorderError::Unsupported(reason)) => {
+                tracing::debug!(reason, "no session border");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot show the session border");
+                None
+            }
+        }
+    }
+
+    /// The secure desktop appeared (`true`) or the user's desktop is back.
+    fn set_secure(&self, secure: bool) {
+        if secure {
+            tracing::info!("the secure desktop is showing: pausing the session");
+        } else {
+            tracing::info!("the user's desktop is back: resuming the session");
+        }
+        let state = if secure {
+            DesktopState::SecureDesktop
+        } else {
+            DesktopState::Normal
+        };
+        self.handle.set_desktop_state(state);
+        if let Some(queue) = &self.input {
+            queue.suspend(secure);
+        }
+        self.hub.session_secure(self.live, secure);
+    }
+
     /// Starts injecting the Viewer's input, if control was granted and
     /// this system allows it. Without it the session stays view only.
     fn start_input(

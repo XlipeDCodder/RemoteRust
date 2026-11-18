@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rr_net::{
-    Agent, AgentOptions, CodePolicy, DeviceIdentity, PairingCodes, SessionCode, SessionError,
-    SourceFilter, Viewer,
+    Agent, AgentOptions, CodePolicy, DeviceIdentity, LimitPolicy, PairingCodes, SessionCode,
+    SessionError, SourceFilter, Viewer,
 };
 use rr_proto::{DevicePublicKey, DisconnectReason};
 
@@ -39,11 +39,23 @@ fn test_policy() -> CodePolicy {
     }
 }
 
+/// An Agent without failure budgets: these tests repeat failures from one
+/// address on purpose (see `wrong_code_blocks_the_address_briefly`).
 fn start_agent_with(
     pairing: bool,
     known: &[DevicePublicKey],
     filter: SourceFilter,
     trust_path: Option<std::path::PathBuf>,
+) -> TestAgent {
+    start_agent_limited(pairing, known, filter, trust_path, LimitPolicy::disabled())
+}
+
+fn start_agent_limited(
+    pairing: bool,
+    known: &[DevicePublicKey],
+    filter: SourceFilter,
+    trust_path: Option<std::path::PathBuf>,
+    limits: LimitPolicy,
 ) -> TestAgent {
     let identity = DeviceIdentity::generate().unwrap();
     let key = identity.public_key();
@@ -51,6 +63,7 @@ fn start_agent_with(
     let options = AgentOptions {
         pairing: codes.clone(),
         trust_path,
+        limits,
         ..AgentOptions::new("test-agent")
     };
     let agent = Agent::new(identity, options, known.iter().copied()).unwrap();
@@ -392,4 +405,29 @@ async fn race_without_candidates_fails_fast() {
         .await
         .unwrap_err();
     assert!(matches!(err, rr_net::RaceError::NoCandidates), "{err:?}");
+}
+
+#[tokio::test]
+async fn wrong_code_blocks_the_address_briefly() {
+    let agent = start_agent_limited(true, &[], loopback_only(), None, LimitPolicy::default());
+    let original = agent.code();
+    let viewer = new_viewer("guesser");
+    let err = viewer
+        .pair(agent.addr, &wrong_code(&original))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SessionError::PairingFailed), "{err:?}");
+
+    // A second guess right away is refused before any TLS work...
+    let err = viewer.pair(agent.addr, &original).await.unwrap_err();
+    assert!(err.is_connection_refused(), "{err:?}");
+
+    // ...and works once the 1 s block is over.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    viewer
+        .pair(agent.addr, &original)
+        .await
+        .unwrap()
+        .close()
+        .await;
 }

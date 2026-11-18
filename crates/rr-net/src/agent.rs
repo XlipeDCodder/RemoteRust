@@ -3,7 +3,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipnet::IpNet;
@@ -13,14 +14,16 @@ use rr_proto::{
     BoundedString, BoundedVec, CandidateAddr, ControlMsg, DevicePublicKey, DisconnectReason,
     Intent, MAX_DEVICE_NAME, Permissions, StreamKind,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::SessionError;
 use crate::channel::{ControlChannel, ControlWriter, disconnect_reason_for};
 use crate::cursor::CursorSender;
+use crate::events::{AgentEvent, PeerInfo};
 use crate::identity::{DeviceIdentity, Fingerprint};
 use crate::input::InputReceiver;
+use crate::limits::{FailureKind, FailureLimiter, LimitPolicy};
 use crate::pairing::{self, PairingCodes, PairingKeys, PairingUnavailable};
 use crate::session::{
     AgentSession, Answer, CONSENT_TIMEOUT, Command, Grant, SessionEvent, SessionHandle,
@@ -89,6 +92,13 @@ pub struct AgentOptions {
     /// How long a request waits for an answer before it is denied
     /// ([`CONSENT_TIMEOUT`] unless testing).
     pub consent_timeout: Duration,
+    /// Where events for the audit log and the local UI go; `None` drops
+    /// them. They are sent with `try_send`: a full queue loses events
+    /// (counted by [`Agent::dropped_events`]) rather than stalling
+    /// connections.
+    pub events: Option<mpsc::Sender<AgentEvent>>,
+    /// Failure budgets ([`LimitPolicy::default`] unless testing).
+    pub limits: LimitPolicy,
 }
 
 impl AgentOptions {
@@ -101,6 +111,8 @@ impl AgentOptions {
             trust_path: None,
             sessions: None,
             consent_timeout: CONSENT_TIMEOUT,
+            events: None,
+            limits: LimitPolicy::default(),
         }
     }
 }
@@ -124,6 +136,11 @@ struct Shared {
     handshakes: Arc<Semaphore>,
     session: Arc<Semaphore>,
     addresses: RwLock<Vec<CandidateAddr>>,
+    events: Option<mpsc::Sender<AgentEvent>>,
+    dropped_events: AtomicU64,
+    limiter: Mutex<FailureLimiter>,
+    /// Each send ends every connection with that reason.
+    ends: watch::Sender<Option<DisconnectReason>>,
 }
 
 struct Authenticated {
@@ -156,6 +173,10 @@ impl Agent {
                 handshakes: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
                 session: Arc::new(Semaphore::new(1)),
                 addresses: RwLock::new(Vec::new()),
+                events: options.events,
+                dropped_events: AtomicU64::new(0),
+                limiter: Mutex::new(FailureLimiter::new(options.limits)),
+                ends: watch::Sender::new(None),
             }),
         })
     }
@@ -164,6 +185,19 @@ impl Agent {
     #[must_use]
     pub fn access(&self) -> &Arc<ViewerAccess> {
         &self.shared.access
+    }
+
+    /// Ends every connection at once, telling each Viewer `reason`: the
+    /// kill switch. A pending consent request is withdrawn; a running
+    /// session's media side sees its events end.
+    pub fn end_all(&self, reason: DisconnectReason) {
+        self.shared.ends.send_replace(Some(reason));
+    }
+
+    /// Events lost because the event queue was full.
+    #[must_use]
+    pub fn dropped_events(&self) -> u64 {
+        self.shared.dropped_events.load(Ordering::Relaxed)
     }
 
     /// Replaces the addresses announced to Viewers after authentication.
@@ -196,6 +230,25 @@ impl Agent {
                 incoming.ignore();
                 continue;
             }
+            let blocked = self
+                .shared
+                .limiter()
+                .address_blocked(source.ip(), std::time::Instant::now());
+            if let Some(blocked) = blocked {
+                if blocked.first {
+                    tracing::warn!(
+                        %source,
+                        remaining_ms = blocked.remaining.as_millis(),
+                        "refusing an address after failed attempts"
+                    );
+                    self.shared.emit(AgentEvent::Blocked {
+                        source: source.ip(),
+                        remaining: blocked.remaining,
+                    });
+                }
+                incoming.refuse();
+                continue;
+            }
             let Ok(permit) = Arc::clone(&self.shared.handshakes).try_acquire_owned() else {
                 tracing::warn!(%source, "too many pending handshakes, refusing");
                 incoming.refuse();
@@ -217,27 +270,15 @@ impl Shared {
         incoming: quinn::Incoming,
         handshake_permit: OwnedSemaphorePermit,
     ) -> Result<(), SessionError> {
-        let deadline = Instant::now()
-            .checked_add(AUTH_TIMEOUT)
-            .ok_or(SessionError::Timeout)?;
-        // The TLS verifier runs inside this await: unknown keys never get
-        // past it while pairing is closed.
-        let conn = timeout_at(deadline, async { incoming.accept()?.await }).await??;
-        let (send, recv) = match timeout_at(deadline, conn.accept_bi()).await {
-            Ok(Ok(streams)) => streams,
-            Ok(Err(err)) => return Err(err.into()),
-            Err(elapsed) => {
-                conn.close(CLOSE_REFUSED, b"timeout");
-                return Err(elapsed.into());
+        let source = incoming.remote_address();
+        let (conn, mut ctl, viewer) = match self.admit(incoming).await {
+            Ok(admitted) => admitted,
+            Err(err) => {
+                self.count_failure(source, &err);
+                return Err(err);
             }
         };
-        let mut ctl = ControlChannel::new(send, recv);
-
-        let viewer = match timeout_at(deadline, self.authenticate(&conn, &mut ctl)).await {
-            Ok(Ok(viewer)) => viewer,
-            Ok(Err(err)) => return Err(refuse(&conn, &mut ctl, err).await),
-            Err(elapsed) => return Err(refuse(&conn, &mut ctl, elapsed.into()).await),
-        };
+        self.limiter().address_succeeded(source.ip());
 
         let Ok(_session) = Arc::clone(&self.session).try_acquire_owned() else {
             let err = SessionError::Refused(DisconnectReason::Busy);
@@ -251,6 +292,12 @@ impl Shared {
             remote = %conn.remote_address(),
             "session started"
         );
+        let peer = PeerInfo::new(&viewer.name, &viewer.key);
+        self.emit(AgentEvent::Connected {
+            viewer: peer.clone(),
+            source,
+        });
+        let connected_at = Instant::now();
         let addrs = self
             .addresses
             .read()
@@ -264,12 +311,15 @@ impl Shared {
 
         let (mut writer, reader) = ctl.split();
         let (incoming, reader_task) = reader.spawn();
+        let mut ends = self.ends.subscribe();
+        ends.mark_unchanged();
         let mut control = Control {
             shared: &self,
             conn: &conn,
             viewer: &viewer,
             writer: &mut writer,
             incoming,
+            ends,
             state: State::Idle,
         };
         let result = control.run().await;
@@ -287,7 +337,87 @@ impl Shared {
             }
         }
         tracing::info!(viewer = %viewer.name, "session ended");
+        let reason = match &result {
+            Ok(reason) => *reason,
+            Err(err) => Some(disconnect_reason_for(err)),
+        };
+        self.emit(AgentEvent::Disconnected {
+            viewer: peer,
+            reason,
+            duration: connected_at.elapsed(),
+        });
         result.map(|_| ())
+    }
+
+    /// TLS (whose verifier rejects unknown keys while pairing is closed),
+    /// the control stream and authentication, all within [`AUTH_TIMEOUT`].
+    async fn admit(
+        &self,
+        incoming: quinn::Incoming,
+    ) -> Result<(quinn::Connection, ControlChannel, Authenticated), SessionError> {
+        let deadline = Instant::now()
+            .checked_add(AUTH_TIMEOUT)
+            .ok_or(SessionError::Timeout)?;
+        let conn = timeout_at(deadline, async { incoming.accept()?.await }).await??;
+        let (send, recv) = match timeout_at(deadline, conn.accept_bi()).await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(elapsed) => {
+                conn.close(CLOSE_REFUSED, b"timeout");
+                return Err(elapsed.into());
+            }
+        };
+        let mut ctl = ControlChannel::new(send, recv);
+        match timeout_at(deadline, self.authenticate(&conn, &mut ctl)).await {
+            Ok(Ok(viewer)) => Ok((conn, ctl, viewer)),
+            Ok(Err(err)) => Err(refuse(&conn, &mut ctl, err).await),
+            Err(elapsed) => Err(refuse(&conn, &mut ctl, elapsed.into()).await),
+        }
+    }
+
+    /// Charges a failed attempt to its address (and the global budget), if
+    /// it was one: a Viewer that simply went away is not a failure.
+    fn count_failure(&self, source: SocketAddr, err: &SessionError) {
+        let Some(kind) = failure_kind(err) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let outcome = self.limiter().address_failed(source.ip(), now);
+        tracing::warn!(
+            %source,
+            %kind,
+            blocked_s = outcome.blocked_for.as_secs(),
+            "connection attempt failed"
+        );
+        self.emit(AgentEvent::AuthFailed {
+            source,
+            kind,
+            blocked_for: outcome.blocked_for,
+        });
+        if let Some(duration) = outcome.pairing_suspended_for {
+            if let Some(until) = now.checked_add(duration) {
+                self.access.suspend_pairing_until(until);
+            }
+            tracing::warn!(
+                secs = duration.as_secs(),
+                "too many failed attempts: pairing new devices is suspended"
+            );
+            self.emit(AgentEvent::PairingSuspended { duration });
+        }
+    }
+
+    fn limiter(&self) -> MutexGuard<'_, FailureLimiter> {
+        // Every limiter update completes before anything can panic, so
+        // poisoning cannot leave it half updated.
+        self.limiter.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(events) = &self.events
+            && events.try_send(event).is_err()
+        {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     async fn authenticate(
@@ -340,6 +470,10 @@ impl Shared {
                     fingerprint = %Fingerprint::of(&key),
                     "paired with a new viewer"
                 );
+                self.emit(AgentEvent::Paired {
+                    viewer: PeerInfo::new(&name, &key),
+                    source: conn.remote_address(),
+                });
             }
         }
         Ok(Authenticated { key, name })
@@ -409,6 +543,8 @@ struct Control<'a> {
     viewer: &'a Authenticated,
     writer: &'a mut ControlWriter,
     incoming: mpsc::Receiver<Result<ControlMsg, SessionError>>,
+    /// [`Agent::end_all`] requests.
+    ends: watch::Receiver<Option<DisconnectReason>>,
     state: State,
 }
 
@@ -428,6 +564,20 @@ impl Control<'_> {
                     Pending::Answer(answer) => self.on_answer(answer).await?,
                     Pending::Command(command) => self.on_command(command).await?,
                 },
+                changed = self.ends.changed() => {
+                    // The sender lives in `Shared`, which outlives this loop.
+                    let reason = changed
+                        .ok()
+                        .and_then(|()| *self.ends.borrow_and_update())
+                        .unwrap_or(DisconnectReason::ShuttingDown);
+                    tracing::info!(
+                        viewer = %self.viewer.name,
+                        ?reason,
+                        "ending the connection on local request"
+                    );
+                    self.state = State::Done;
+                    Step::Stop(Some(reason))
+                }
             };
             if let Step::Stop(reason) = step {
                 return Ok(reason);
@@ -496,6 +646,22 @@ impl Control<'_> {
             return Err(denied);
         }
         let sessions = self.shared.sessions.as_ref().ok_or(denied)?;
+        let blocked = self
+            .shared
+            .limiter()
+            .key_blocked(&self.viewer.key, std::time::Instant::now());
+        if let Some(blocked) = blocked {
+            tracing::info!(
+                viewer = %self.viewer.name,
+                wait_ms = blocked.remaining.as_millis(),
+                "session request refused: this device asked again too soon"
+            );
+            self.shared.emit(AgentEvent::SessionRefused {
+                viewer: self.peer(),
+                reason: DisconnectReason::RateLimited,
+            });
+            return Err(SessionError::Refused(DisconnectReason::RateLimited));
+        }
         let (reply, receiver) = oneshot::channel();
         let request = SessionRequest {
             viewer_name: self.viewer.name.clone(),
@@ -511,6 +677,10 @@ impl Control<'_> {
             .checked_add(self.shared.consent_timeout)
             .ok_or(SessionError::Timeout)?;
         tracing::info!(viewer = %self.viewer.name, %requested, "session requested, asking the local user");
+        self.shared.emit(AgentEvent::SessionRequested {
+            viewer: self.peer(),
+            permissions: requested,
+        });
         self.state = State::Asking {
             requested,
             reply: receiver,
@@ -527,21 +697,26 @@ impl Control<'_> {
             AnswerOutcome::Answered(Answer::Accept { grant, session }) => (grant, session),
             AnswerOutcome::Answered(Answer::Deny) | AnswerOutcome::Dropped => {
                 tracing::info!(viewer = %self.viewer.name, "session denied");
-                return Err(SessionError::Refused(DisconnectReason::ConsentDenied));
+                return Err(self.refused(DisconnectReason::ConsentDenied));
             }
             AnswerOutcome::TimedOut => {
                 tracing::info!(viewer = %self.viewer.name, "session request timed out");
-                return Err(SessionError::Refused(DisconnectReason::ConsentTimeout));
+                return Err(self.refused(DisconnectReason::ConsentTimeout));
             }
         };
         let permissions = grant.permissions.intersection(requested);
         if !permissions.contains(Permissions::VIEW) {
             let _ = reply.send(Err(SessionError::Refused(DisconnectReason::ConsentDenied)));
-            return Err(SessionError::Refused(DisconnectReason::ConsentDenied));
+            return Err(self.refused(DisconnectReason::ConsentDenied));
         }
         match self.start(&grant, permissions).await {
             Ok((session, active)) => {
                 tracing::info!(viewer = %self.viewer.name, %permissions, "session accepted");
+                self.shared.limiter().key_accepted(&self.viewer.key);
+                self.shared.emit(AgentEvent::SessionAccepted {
+                    viewer: self.peer(),
+                    permissions,
+                });
                 self.state = active;
                 if reply.send(Ok(session)).is_err() {
                     // The media side is gone already: nothing to stream.
@@ -555,6 +730,25 @@ impl Control<'_> {
                 Err(SessionError::Refused(reason))
             }
         }
+    }
+
+    fn peer(&self) -> PeerInfo {
+        PeerInfo::new(&self.viewer.name, &self.viewer.key)
+    }
+
+    /// A denied or unanswered request: the device waits before it may ask
+    /// again (blueprint v2 §7.5).
+    fn refused(&self, reason: DisconnectReason) -> SessionError {
+        let wait = self
+            .shared
+            .limiter()
+            .key_refused(self.viewer.key, std::time::Instant::now());
+        tracing::debug!(viewer = %self.viewer.name, wait_s = wait.as_secs(), "next request delayed");
+        self.shared.emit(AgentEvent::SessionRefused {
+            viewer: self.peer(),
+            reason,
+        });
+        SessionError::Refused(reason)
     }
 
     /// Sends `SessionStart` and the encoder name, then opens the video
@@ -620,6 +814,12 @@ impl Control<'_> {
                     .await?;
                 Ok(Step::Continue)
             }
+            Some(Command::Desktop(state)) => {
+                self.writer
+                    .send(&ControlMsg::DesktopState { state })
+                    .await?;
+                Ok(Step::Continue)
+            }
             Some(Command::End(reason)) => {
                 self.state = State::Done;
                 Ok(Step::Stop(Some(reason)))
@@ -660,6 +860,31 @@ async fn next_pending(state: &mut State) -> Pending {
         }),
         State::Active { commands, .. } => Pending::Command(commands.recv().await),
         State::Idle | State::Done => std::future::pending().await,
+    }
+}
+
+/// Whether a failed connection attempt counts against its address, and as
+/// what. A Viewer that closed or lost its connection (for instance the
+/// losing paths of its connection race) is not a failure.
+fn failure_kind(err: &SessionError) -> Option<FailureKind> {
+    match err {
+        SessionError::Timeout | SessionError::Connection(quinn::ConnectionError::TimedOut) => {
+            Some(FailureKind::Timeout)
+        }
+        // Locally detected: the TLS verifier refused the key, or the peer
+        // broke the QUIC/TLS rules.
+        SessionError::Connection(quinn::ConnectionError::TransportError(_)) => {
+            Some(FailureKind::Handshake)
+        }
+        SessionError::PairingFailed | SessionError::Refused(DisconnectReason::PairingFailed) => {
+            Some(FailureKind::WrongCode)
+        }
+        SessionError::Refused(DisconnectReason::NotPaired) => Some(FailureKind::NotPaired),
+        SessionError::Refused(DisconnectReason::PairingUnavailable) => {
+            Some(FailureKind::PairingUnavailable)
+        }
+        SessionError::Protocol(_) | SessionError::Frame(_) => Some(FailureKind::Protocol),
+        _ => None,
     }
 }
 

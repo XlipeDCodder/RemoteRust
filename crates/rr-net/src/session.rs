@@ -8,7 +8,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use rr_proto::{DevicePublicKey, DisconnectReason, MonitorInfo, Permissions};
+use rr_proto::{DesktopState, DevicePublicKey, DisconnectReason, MonitorInfo, Permissions};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::SessionError;
@@ -84,6 +84,13 @@ impl SessionRequest {
         self.reply.closed().await;
     }
 
+    /// Whether the request is gone already (see
+    /// [`SessionRequest::withdrawn`]), for prompts that poll.
+    #[must_use]
+    pub fn is_withdrawn(&self) -> bool {
+        self.reply.is_closed()
+    }
+
     /// Accepts: the Agent sends `SessionStart`, opens the video stream and
     /// returns the running session.
     ///
@@ -126,6 +133,7 @@ pub enum SessionEvent {
 #[derive(Debug)]
 pub(crate) enum Command {
     Encoder(String),
+    Desktop(DesktopState),
     End(DisconnectReason),
 }
 
@@ -191,6 +199,12 @@ impl SessionHandle {
     /// Tells the Viewer which encoder is now in use.
     pub fn set_encoder(&self, name: &str) {
         let _ = self.commands.try_send(Command::Encoder(name.to_owned()));
+    }
+
+    /// Tells the Viewer that the secure desktop appeared or went away
+    /// (blueprint v2 §7.3).
+    pub fn set_desktop_state(&self, state: DesktopState) {
+        let _ = self.commands.try_send(Command::Desktop(state));
     }
 
     /// Ends the session, telling the Viewer why.

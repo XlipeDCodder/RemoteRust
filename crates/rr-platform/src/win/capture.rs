@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
@@ -163,7 +163,9 @@ impl DxgiCapturer {
         // SAFETY: duplicates this output for this device; the result is an
         // owned interface.
         let duplication = unsafe { self.output.DuplicateOutput(&self.device) }.map_err(|err| {
-            if err.code() == DXGI_ERROR_ACCESS_LOST {
+            // Access denied: the secure desktop (UAC, lock screen) is
+            // showing, which only SYSTEM may capture. It goes away again.
+            if err.code() == DXGI_ERROR_ACCESS_LOST || err.code() == E_ACCESSDENIED {
                 CaptureError::AccessLost
             } else {
                 os_error("DuplicateOutput", &err)

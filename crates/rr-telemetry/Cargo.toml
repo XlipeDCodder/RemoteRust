@@ -1,15 +1,19 @@
 [package]
 name = "rr-telemetry"
-description = "RustRemote logging setup shared by every binary."
+description = "RustRemote logging setup and audit log shared by every binary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

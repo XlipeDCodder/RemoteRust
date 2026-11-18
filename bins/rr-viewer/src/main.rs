@@ -332,6 +332,10 @@ const fn describe(reason: DisconnectReason) -> &'static str {
         DisconnectReason::ConsentDenied => "the person at the Agent denied the session",
         DisconnectReason::ConsentTimeout => "nobody at the Agent answered in time",
         DisconnectReason::MediaFailed => "the Agent could not capture or encode the screen",
+        DisconnectReason::StoppedLocally => "the person at the Agent stopped sharing",
+        DisconnectReason::RateLimited => {
+            "too many refused or failed attempts from this device; wait a few minutes and try again"
+        }
     }
 }
 
@@ -422,6 +426,11 @@ fn explain(err: SessionError) -> anyhow::Error {
         Some("the Agent refused this device, or its key is not the pinned one (pair again?)")
     } else if matches!(err, SessionError::Timeout) {
         Some("no answer: is the Agent running, listening on this network and allowing this source?")
+    } else if err.is_connection_refused() {
+        Some(
+            "the Agent refused the connection: too many failed attempts from this address \
+             recently (wait a few minutes) or too many connections at once",
+        )
     } else {
         None
     };

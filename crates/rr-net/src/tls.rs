@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
 use quinn::{IdleTimeout, TransportConfig, VarInt};
@@ -56,6 +56,18 @@ pub struct ViewerAccess {
 struct AccessState {
     known: HashSet<DevicePublicKey>,
     pairing_open: bool,
+    /// Pairing stays closed until then after repeated failures
+    /// (blueprint v2 §7.5), whatever `pairing_open` says.
+    pairing_suspended_until: Option<Instant>,
+}
+
+impl AccessState {
+    fn pairing_open(&self) -> bool {
+        self.pairing_open
+            && self
+                .pairing_suspended_until
+                .is_none_or(|until| Instant::now() >= until)
+    }
 }
 
 impl ViewerAccess {
@@ -66,6 +78,7 @@ impl ViewerAccess {
             state: RwLock::new(AccessState {
                 known: known.into_iter().collect(),
                 pairing_open,
+                pairing_suspended_until: None,
             }),
         }
     }
@@ -79,7 +92,23 @@ impl ViewerAccess {
     /// Whether unknown keys may connect to pair.
     #[must_use]
     pub fn pairing_open(&self) -> bool {
-        self.read(|state| state.pairing_open)
+        self.read(AccessState::pairing_open)
+    }
+
+    /// Keeps pairing closed until `until`, whatever
+    /// [`ViewerAccess::set_pairing_open`] says meanwhile.
+    pub fn suspend_pairing_until(&self, until: Instant) {
+        self.write(|state| state.pairing_suspended_until = Some(until));
+    }
+
+    /// When a pairing suspension ends, if one is in force.
+    #[must_use]
+    pub fn pairing_suspended_until(&self) -> Option<Instant> {
+        self.read(|state| {
+            state
+                .pairing_suspended_until
+                .filter(|until| *until > Instant::now())
+        })
     }
 
     /// Opens or closes pairing for subsequent handshakes.
@@ -100,7 +129,7 @@ impl ViewerAccess {
     }
 
     fn admits(&self, key: &DevicePublicKey) -> bool {
-        self.read(|state| state.pairing_open || state.known.contains(key))
+        self.read(|state| state.pairing_open() || state.known.contains(key))
     }
 
     // A panic while holding the lock cannot leave `AccessState` half

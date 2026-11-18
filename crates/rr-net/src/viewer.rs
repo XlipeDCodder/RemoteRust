@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rr_config::{KnownAgent, MAX_KNOWN_ADDRESSES, sanitize_device_name};
 use rr_proto::{
-    BoundedString, CandidateAddr, ControlMsg, DevicePublicKey, DisconnectReason, Intent,
-    MAX_DEVICE_NAME, MonitorInfo, NetworkClass, Permissions,
+    BoundedString, CandidateAddr, ControlMsg, DesktopState, DevicePublicKey, DisconnectReason,
+    Intent, MAX_DEVICE_NAME, MonitorInfo, NetworkClass, Permissions,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -405,6 +405,9 @@ pub enum RemoteEvent {
     Encoder(String),
     /// The session is over; `Some` carries the Agent's reason.
     Ended(Option<DisconnectReason>),
+    /// The Agent's desktop changed: on the secure desktop, video holds the
+    /// last frame and input must stop until it is `Normal` again.
+    Desktop(DesktopState),
 }
 
 /// Cheap, cloneable control over a [`RemoteSession`], usable from any
@@ -571,6 +574,9 @@ async fn run_control(
                     }
                 }
                 Some(Ok(ControlMsg::Pong { .. })) => {}
+                Some(Ok(ControlMsg::DesktopState { state })) => {
+                    let _ = events.send(RemoteEvent::Desktop(state)).await;
+                }
                 Some(Ok(ControlMsg::Disconnect { reason })) => break Some(reason),
                 Some(Ok(_)) => {
                     let _ = timeout(GOODBYE_TIMEOUT, writer.goodbye(DisconnectReason::ProtocolError)).await;

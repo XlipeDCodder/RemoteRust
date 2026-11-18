@@ -7,6 +7,10 @@
 //! shortcuts too (Alt+Tab, the Windows key) while the window has the focus.
 //! The Viewer's own functions then live in the toolbar at the top center
 //! ([`crate::toolbar`]). Viewing only, F1 and F11 also work locally.
+//!
+//! While the Agent shows its secure desktop (a UAC prompt, the lock
+//! screen), the picture is dimmed with a notice and no input is sent:
+//! only the person at the Agent can answer there (blueprint v2 §7.3).
 
 use std::fmt;
 use std::sync::Arc;
@@ -17,7 +21,7 @@ use anyhow::Context as _;
 use rr_net::{CursorReceiver, RemoteEvent, RemoteSession, SessionControl, StatsSource};
 use rr_platform::hook::KeyboardHook;
 use rr_platform::input::InputError;
-use rr_proto::{CursorMsg, DisconnectReason, KeyCode as RemoteKey};
+use rr_proto::{CursorMsg, DesktopState, DisconnectReason, KeyCode as RemoteKey};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
@@ -54,6 +58,8 @@ pub enum UserEvent {
     Key(RemoteKey, bool),
     /// A pointer update from the Agent.
     Cursor(CursorMsg),
+    /// The Agent's secure desktop appeared or went away.
+    Desktop(DesktopState),
 }
 
 /// Window placement.
@@ -186,6 +192,7 @@ pub fn run(
         toolbar: Toolbar::default(),
         pointer: None,
         applied_cursor: None,
+        paused: false,
     };
     let result = event_loop.run_app(&mut app);
     let outcome = app.outcome.take().unwrap_or(Outcome::Closed);
@@ -221,6 +228,7 @@ async fn forward_events(mut events: mpsc::Receiver<RemoteEvent>, proxy: EventLoo
         let event = match event {
             RemoteEvent::Encoder(name) => UserEvent::Encoder(name),
             RemoteEvent::Ended(reason) => UserEvent::Ended(reason),
+            RemoteEvent::Desktop(state) => UserEvent::Desktop(state),
         };
         if proxy.send_event(event).is_err() {
             return;
@@ -300,6 +308,8 @@ struct App<'a> {
     pointer: Option<(f64, f64)>,
     /// The local pointer set last; `None` forces setting it again.
     applied_cursor: Option<LocalPointer>,
+    /// The Agent shows its secure desktop: input is not sent.
+    paused: bool,
 }
 
 impl App<'_> {
@@ -413,6 +423,9 @@ impl App<'_> {
                     if let (Some(sprite), Some(picture)) = (&sprite, picture) {
                         paint_sprite(ui.ctx(), sprite, picture);
                     }
+                    if self.paused {
+                        paint_secure_notice(ui.ctx());
+                    }
                     action = self
                         .toolbar
                         .ui(ui.ctx(), mode, self.overlay.visible, fullscreen);
@@ -488,7 +501,11 @@ impl App<'_> {
         let Some(window) = self.window.clone() else {
             return;
         };
-        let wanted = if self.input.is_some() && self.cursor.has_shape() && self.over_picture() {
+        let wanted = if self.input.is_some()
+            && !self.paused
+            && self.cursor.has_shape()
+            && self.over_picture()
+        {
             if self.cursor.visible() {
                 LocalPointer::Remote
             } else {
@@ -517,9 +534,39 @@ impl App<'_> {
         self.applied_cursor = Some(wanted);
     }
 
+    /// The Agent's secure desktop appeared (input stops, the picture is
+    /// dimmed) or went away.
+    fn on_desktop(&mut self, event_loop: &ActiveEventLoop, state: DesktopState) {
+        let paused = state == DesktopState::SecureDesktop;
+        if paused == self.paused {
+            return;
+        }
+        self.paused = paused;
+        if paused {
+            tracing::info!("the remote computer shows a system prompt: input paused");
+            if let Some(input) = &mut self.input {
+                input.release_all(Instant::now());
+            }
+        } else {
+            tracing::info!("the remote desktop is back: input resumed");
+        }
+        let focused = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.has_focus());
+        if let Some(hook) = &self.hook {
+            hook.set_active(focused && !paused);
+        }
+        self.applied_cursor = None;
+        self.update_local_pointer(event_loop);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn on_focus(&mut self, focused: bool) {
         if let Some(hook) = &self.hook {
-            hook.set_active(focused);
+            hook.set_active(focused && !self.paused);
         }
         if !focused && let Some(input) = &mut self.input {
             input.release_all(Instant::now());
@@ -532,6 +579,7 @@ impl App<'_> {
         };
         let down = event.state == ElementState::Pressed;
         match &mut self.input {
+            Some(_) if self.paused => {}
             Some(input) => {
                 // With the hook, keys arrive as `UserEvent::Key` instead.
                 if self.hook.is_none()
@@ -564,6 +612,9 @@ impl App<'_> {
             window.request_redraw();
         }
         self.update_local_pointer(event_loop);
+        if self.paused {
+            return;
+        }
         let over_toolbar = self.over_toolbar();
         let picture = self.renderer.as_ref().and_then(Renderer::picture_rect);
         let (Some(input), Some(pointer), Some(picture)) = (&mut self.input, self.pointer, picture)
@@ -588,7 +639,7 @@ impl App<'_> {
         let down = state == ElementState::Pressed;
         // Presses count only over the picture; releases always do, so
         // nothing stays pressed on the Agent.
-        let over_picture = self.over_picture();
+        let over_picture = self.over_picture() && !self.paused;
         if let Some(input) = &mut self.input
             && (!down || over_picture)
         {
@@ -597,7 +648,7 @@ impl App<'_> {
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        if !self.over_picture() {
+        if self.paused || !self.over_picture() {
             return;
         }
         let Some(input) = &mut self.input else {
@@ -624,6 +675,26 @@ fn toggle_fullscreen(window: &Window) {
         Some(Fullscreen::Borderless(window.current_monitor()))
     };
     window.set_fullscreen(next);
+}
+
+/// Dims the picture and explains why nothing moves: the remote computer
+/// shows a UAC prompt or its lock screen, which only the person there can
+/// answer, and which it cannot share.
+fn paint_secure_notice(ctx: &egui::Context) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::unique("secure-desktop"),
+    ));
+    let screen = ctx.content_rect();
+    painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(170));
+    painter.text(
+        screen.center(),
+        egui::Align2::CENTER_CENTER,
+        "The remote computer is showing a system prompt (UAC or lock screen).\n\
+         Waiting for the person there to answer it; control resumes afterwards.",
+        egui::FontId::proportional(18.0),
+        egui::Color32::WHITE,
+    );
 }
 
 /// Paints the remote pointer over the picture, scaled like the picture.
@@ -726,10 +797,13 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 self.control.close();
             }
             UserEvent::Key(key, down) => {
-                if let Some(input) = &mut self.input {
+                if let Some(input) = &mut self.input
+                    && !self.paused
+                {
                     input.key(key, down, Instant::now());
                 }
             }
+            UserEvent::Desktop(state) => self.on_desktop(event_loop, state),
             UserEvent::Cursor(msg) => {
                 if self.cursor.update(msg) {
                     self.applied_cursor = None;

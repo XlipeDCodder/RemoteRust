@@ -6,9 +6,14 @@
 //! - when the input stream or the session ends;
 //! - by a watchdog: while something is held the Viewer sends `Held` every
 //!   250 ms, and one second without any input releases everything. That
-//!   covers a pulled cable, which QUIC only notices after its idle timeout.
+//!   covers a pulled cable, which QUIC only notices after its idle timeout;
+//! - by the kill switch ([`Queue::halt`]): nothing more is injected, not
+//!   even the rest of a batch already taken;
+//! - while the secure desktop shows ([`Queue::suspend`]): input is dropped
+//!   until the user's desktop is back.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,8 +37,12 @@ struct State {
     /// When the last message of any kind arrived.
     last_seen: Option<Instant>,
     ended: bool,
+    /// Input is dropped (the secure desktop is showing).
+    suspended: bool,
     coalesced: u64,
     overflows: u64,
+    /// Messages dropped while suspended or halted.
+    dropped: u64,
 }
 
 /// Messages from the network task to the input thread.
@@ -41,6 +50,8 @@ struct State {
 pub struct Queue {
     state: Mutex<State>,
     wake: Condvar,
+    /// The kill switch fired: checked before every injected event.
+    halted: AtomicBool,
 }
 
 impl Queue {
@@ -55,6 +66,12 @@ impl Queue {
     pub fn push(&self, msg: InputMsg) {
         let mut state = self.lock();
         state.last_seen = Some(Instant::now());
+        if state.suspended || state.ended {
+            if !matches!(msg, InputMsg::Held) {
+                state.dropped += 1;
+            }
+            return;
+        }
         match msg {
             InputMsg::Held => return,
             InputMsg::MouseMove { .. }
@@ -80,6 +97,42 @@ impl Queue {
     /// and stops.
     pub fn end(&self) {
         self.lock().ended = true;
+        self.wake.notify_one();
+    }
+
+    /// The kill switch: drops everything waiting, stops the input thread
+    /// before its next event (even inside a batch) and has it release
+    /// everything held. Never blocks for long: it runs on the keyboard
+    /// hook's thread.
+    pub fn halt(&self) {
+        self.halted.store(true, Ordering::SeqCst);
+        let mut state = self.lock();
+        state.events.clear();
+        state.ended = true;
+        drop(state);
+        self.wake.notify_one();
+    }
+
+    /// Whether [`Queue::halt`] was called.
+    fn halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
+    }
+
+    /// Drops the Viewer's input from now on (`true`) and releases what is
+    /// held, or takes it again (`false`). For the secure desktop, where
+    /// injection fails anyway and only the local user may answer.
+    pub fn suspend(&self, suspended: bool) {
+        let mut state = self.lock();
+        if state.suspended == suspended {
+            return;
+        }
+        state.suspended = suspended;
+        if suspended {
+            state.dropped += u64::try_from(state.events.len()).unwrap_or(u64::MAX);
+            state.events.clear();
+            state.events.push_back(InputMsg::ReleaseAll);
+        }
+        drop(state);
         self.wake.notify_one();
     }
 
@@ -211,11 +264,14 @@ fn run(mut injector: Injector, queue: &Queue, monitor: u8) {
     loop {
         let (ended, last_seen) = queue.take(TICK, &mut batch);
         for msg in batch.drain(..) {
+            if queue.halted() {
+                break;
+            }
             if let Err(err) = apply(&mut injector, &mut totals, msg, monitor) {
                 failures.note(&mut totals, &err);
             }
         }
-        if ended {
+        if ended || queue.halted() {
             break;
         }
         if injector.holding() && last_seen.is_none_or(|at| at.elapsed() >= WATCHDOG) {
@@ -242,6 +298,7 @@ fn run(mut injector: Injector, queue: &Queue, monitor: u8) {
         watchdog = totals.watchdog,
         other_monitor = totals.other_monitor,
         overflows = state.overflows,
+        dropped = state.dropped,
         failures = totals.failures,
         "remote control stopped"
     );
@@ -386,6 +443,70 @@ mod tests {
         queue.take(Duration::ZERO, &mut batch);
         assert_eq!(batch, [InputMsg::ReleaseAll]);
         assert_eq!(queue.lock().overflows, 1);
+    }
+
+    fn key(code: KeyCode, down: bool) -> InputMsg {
+        InputMsg::Key { code, down }
+    }
+
+    #[test]
+    fn suspension_releases_once_and_drops_input_until_resumed() {
+        let queue = Queue::default();
+        queue.push(key(KeyCode::KeyA, true));
+        queue.suspend(true);
+        queue.suspend(true);
+        queue.push(key(KeyCode::KeyB, true));
+        let mut batch = Vec::new();
+        queue.take(Duration::ZERO, &mut batch);
+        assert_eq!(batch, [InputMsg::ReleaseAll]);
+        assert_eq!(queue.lock().dropped, 2);
+
+        queue.suspend(false);
+        queue.push(key(KeyCode::KeyC, true));
+        batch.clear();
+        queue.take(Duration::ZERO, &mut batch);
+        assert_eq!(batch, [key(KeyCode::KeyC, true)]);
+    }
+
+    #[test]
+    fn halting_stops_injection_and_releases_everything() {
+        let recorder = Recorder::default();
+        let queue = Arc::new(Queue::default());
+        let thread = InputThread::start(Box::new(recorder.clone()), Arc::clone(&queue), 0).unwrap();
+        queue.push(key(KeyCode::ShiftLeft, true));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorder.calls().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        queue.halt();
+        // Input that still arrives is dropped.
+        queue.push(key(KeyCode::KeyX, true));
+        drop(thread);
+        assert_eq!(
+            recorder.calls(),
+            ["key ShiftLeft true", "key ShiftLeft false"]
+        );
+    }
+
+    #[test]
+    fn a_halted_thread_skips_the_rest_of_its_batch() {
+        let recorder = Recorder::default();
+        let mut injector = Injector::new(Box::new(recorder.clone()));
+        let queue = Queue::default();
+        queue.push(key(KeyCode::KeyA, true));
+        queue.push(key(KeyCode::KeyA, false));
+        let mut batch = Vec::new();
+        queue.take(Duration::ZERO, &mut batch);
+        queue.halt();
+        // What `run` does with a batch taken just before the halt.
+        let mut totals = Totals::default();
+        for msg in batch.drain(..) {
+            if queue.halted() {
+                break;
+            }
+            apply(&mut injector, &mut totals, msg, 0).unwrap();
+        }
+        assert!(recorder.calls().is_empty());
     }
 
     #[test]

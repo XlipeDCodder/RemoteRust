@@ -1,8 +1,9 @@
-//! Low-level keyboard hook for the Viewer (blueprint v2 §8.7).
+//! Low-level keyboard hooks: the Viewer's system-shortcut capture
+//! (blueprint v2 §8.7) and the Agent's kill switch (§7.6).
 //!
-//! The hook runs on its own thread with its own message loop: Windows
+//! Each hook runs on its own thread with its own message loop: Windows
 //! holds every keystroke of the desktop until a low-level hook returns, so
-//! it must never wait for the Viewer's render thread.
+//! it must never wait for anything else.
 #![allow(unsafe_code)] // FFI module: every block below is justified with `SAFETY:`.
 
 use std::cell::RefCell;
@@ -23,9 +24,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::input::{InputError, KeyCode};
 use crate::keymap;
+use crate::killswitch::{Detector, Verdict};
 
 /// Receives the keys the hook takes, on the hook thread.
 pub(crate) type Forward = Box<dyn FnMut(KeyCode, bool) + Send>;
+
+/// Decides, on the hook thread, whether to take an event away from the
+/// system.
+type Handler = Box<dyn FnMut(&KBDLLHOOKSTRUCT) -> bool + Send>;
 
 /// Events Windows synthesizes alongside real keys: the left Ctrl sent with
 /// AltGr and the shifts some keyboards wrap around navigation keys. They
@@ -51,7 +57,7 @@ struct State {
 }
 
 thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
 }
 
 /// The set-1 scan code of the event, `0xE0xx` for extended keys.
@@ -127,11 +133,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // SAFETY: for HC_ACTION, `lparam` points to the event's
         // KBDLLHOOKSTRUCT for the duration of this call.
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        let take = STATE.with(|state| {
-            state
+        let take = HANDLER.with(|handler| {
+            handler
                 .try_borrow_mut()
                 .ok()
-                .and_then(|mut state| state.as_mut().map(|state| state.on_event(event)))
+                .and_then(|mut handler| handler.as_mut().map(|handler| handler(event)))
                 .unwrap_or(false)
         });
         if take {
@@ -148,12 +154,58 @@ pub(crate) struct Hook {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Installs the hook on a new thread. Keys are taken only while `active`.
+/// Installs the Viewer's hook on a new thread. Keys are taken only while
+/// `active`.
 pub(crate) fn install(active: Arc<AtomicBool>, forward: Forward) -> Result<Hook, InputError> {
+    let mut state = State {
+        active,
+        forward,
+        taken: HashSet::new(),
+    };
+    spawn("rr-kbhook", Box::new(move |event| state.on_event(event)))
+}
+
+/// Installs the kill-switch hook on a new thread: `on_trigger` runs when
+/// the physical hotkey is pressed.
+pub(crate) fn install_kill_switch(
+    mut detector: Detector,
+    on_trigger: impl Fn() + Send + 'static,
+) -> Result<Hook, InputError> {
+    spawn(
+        "rr-killswitch",
+        Box::new(move |event| kill_switch_event(&mut detector, &on_trigger, event)),
+    )
+}
+
+/// The kill switch's view of one event: physical keys only. Injected
+/// events (`SendInput`, including the Agent's own remote input) neither
+/// fire it nor count as held modifiers.
+fn kill_switch_event(
+    detector: &mut Detector,
+    on_trigger: &dyn Fn(),
+    event: &KBDLLHOOKSTRUCT,
+) -> bool {
+    if event.flags.0 & LLKHF_INJECTED.0 != 0 {
+        return false;
+    }
+    let Some(key) = translate(event) else {
+        return false;
+    };
+    match detector.on_key(key, event.flags.0 & LLKHF_UP.0 == 0) {
+        Verdict::Pass => false,
+        Verdict::Fired => {
+            on_trigger();
+            true
+        }
+        Verdict::Swallow => true,
+    }
+}
+
+fn spawn(name: &str, handler: Handler) -> Result<Hook, InputError> {
     let (ready, started) = mpsc::channel::<Result<u32, InputError>>();
     let thread = std::thread::Builder::new()
-        .name("rr-kbhook".to_owned())
-        .spawn(move || run(active, forward, &ready))
+        .name(name.to_owned())
+        .spawn(move || run(handler, &ready))
         .map_err(|err| InputError::Os {
             context: "starting the keyboard hook thread",
             code: 0,
@@ -179,14 +231,8 @@ pub(crate) fn install(active: Arc<AtomicBool>, forward: Forward) -> Result<Hook,
     }
 }
 
-fn run(active: Arc<AtomicBool>, forward: Forward, ready: &mpsc::Sender<Result<u32, InputError>>) {
-    STATE.with(|state| {
-        *state.borrow_mut() = Some(State {
-            active,
-            forward,
-            taken: HashSet::new(),
-        });
-    });
+fn run(handler: Handler, ready: &mpsc::Sender<Result<u32, InputError>>) {
+    HANDLER.with(|slot| *slot.borrow_mut() = Some(handler));
     // SAFETY: the module handle of this executable; no preconditions.
     let module = match unsafe { GetModuleHandleW(None) } {
         Ok(module) => module,
@@ -219,7 +265,7 @@ fn run(active: Arc<AtomicBool>, forward: Forward, ready: &mpsc::Sender<Result<u3
     while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.0 > 0 {}
     // SAFETY: the hook installed above, removed once.
     let _ = unsafe { UnhookWindowsHookEx(hook) };
-    STATE.with(|state| state.borrow_mut().take());
+    HANDLER.with(|slot| slot.borrow_mut().take());
 }
 
 impl Drop for Hook {
@@ -333,6 +379,103 @@ mod tests {
         drop(hook);
         let again = install(Arc::new(AtomicBool::new(false)), Box::new(|_, _| {})).unwrap();
         drop(again);
+    }
+
+    /// A kill switch fed by `events`; returns what the hook did with each
+    /// and how often it fired.
+    fn kill_switch(events: &[KBDLLHOOKSTRUCT]) -> (Vec<bool>, usize) {
+        use crate::killswitch::Hotkey;
+        let fired = Arc::new(Mutex::new(0_usize));
+        let count = Arc::clone(&fired);
+        let on_trigger = move || *count.lock().unwrap() += 1;
+        let mut detector = Detector::new(Hotkey::DEFAULT);
+        let taken = events
+            .iter()
+            .map(|event| kill_switch_event(&mut detector, &on_trigger, event))
+            .collect();
+        let fired = *fired.lock().unwrap();
+        (taken, fired)
+    }
+
+    // Ctrl, Alt, Shift, F12 as the keyboard reports them.
+    const CTRL: (u32, u32) = (0x1D, 0xA2);
+    const ALT: (u32, u32) = (0x38, 0xA4);
+    const SHIFT: (u32, u32) = (0x2A, 0xA0);
+    const F12: (u32, u32) = (0x58, 0x7B);
+
+    fn key((scan, vk): (u32, u32), flags: u32) -> KBDLLHOOKSTRUCT {
+        event(scan, vk, flags)
+    }
+
+    #[test]
+    fn kill_switch_fires_on_physical_keys_only() {
+        let combo = |flags| {
+            [
+                key(CTRL, flags),
+                key(ALT, flags),
+                key(SHIFT, flags),
+                key(F12, flags),
+                key(F12, flags | UP),
+            ]
+        };
+        // Physical: fires, and F12 is taken from the system.
+        assert_eq!(
+            kill_switch(&combo(0)),
+            (vec![false, false, false, true, true], 1)
+        );
+        // Injected (a Viewer's remote keys): nothing happens.
+        assert_eq!(kill_switch(&combo(INJECTED)), (vec![false; 5], 0));
+    }
+
+    #[test]
+    fn injected_modifiers_neither_help_nor_block() {
+        // Injected Ctrl+Alt+Shift held, then a physical F12: no trigger.
+        let (_, fired) = kill_switch(&[
+            key(CTRL, INJECTED),
+            key(ALT, INJECTED),
+            key(SHIFT, INJECTED),
+            key(F12, 0),
+        ]);
+        assert_eq!(fired, 0);
+        // Injected modifiers held (or released) around a physical combo:
+        // it still fires.
+        let (_, fired) = kill_switch(&[
+            key(CTRL, INJECTED),
+            key(CTRL, 0),
+            key(CTRL, INJECTED | UP),
+            key(ALT, 0),
+            key(SHIFT, INJECTED | UP),
+            key(SHIFT, 0),
+            key(ALT, INJECTED | UP),
+            key(F12, 0),
+        ]);
+        assert_eq!(fired, 1);
+    }
+
+    /// The physical hotkey cannot be produced here: this checks that the
+    /// hook installs, and that the injected combination does not fire it.
+    #[test]
+    #[ignore = "installs a hook and types on the live desktop"]
+    fn injected_hotkey_does_not_fire_the_installed_hook() {
+        use crate::input::{InputBackend as _, KeyCode as K};
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let hook = install_kill_switch(
+            Detector::new(crate::killswitch::Hotkey::DEFAULT),
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .unwrap();
+        let mut backend =
+            crate::win::input::SendInputBackend::new(crate::input::SharedArea::default());
+        for key in [K::ControlLeft, K::AltLeft, K::ShiftLeft, K::F12] {
+            backend.key(key, true).unwrap();
+        }
+        for key in [K::F12, K::ShiftLeft, K::AltLeft, K::ControlLeft] {
+            backend.key(key, false).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(hook);
+        assert!(!fired.load(Ordering::SeqCst));
     }
 
     #[test]

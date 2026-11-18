@@ -32,7 +32,7 @@ pub mod session;
 pub mod video;
 
 pub use bounded::{BoundedBytes, BoundedString, BoundedVec, TooLong};
-pub use control::{ControlMsg, DisconnectReason, Intent, MAX_ENCODER_NAME};
+pub use control::{ControlMsg, DesktopState, DisconnectReason, Intent, MAX_ENCODER_NAME};
 pub use cursor::CursorMsg;
 pub use frame::FrameError;
 pub use input::{InputMsg, KeyCode, MouseButton};

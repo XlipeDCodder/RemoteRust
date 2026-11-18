@@ -81,6 +81,19 @@ impl SessionError {
         // RFC 9000 §20.1: CRYPTO_ERROR is 0x0100–0x01ff (TLS alert + 0x100).
         (0x100..0x200).contains(&u64::from(code))
     }
+
+    /// Whether the Agent refused the connection before any TLS work: it
+    /// had too many handshakes pending, or this address failed too often
+    /// recently and must wait (blueprint v2 §7.5).
+    #[must_use]
+    pub fn is_connection_refused(&self) -> bool {
+        // RFC 9000 §20.1: CONNECTION_REFUSED.
+        matches!(
+            self,
+            Self::Connection(quinn::ConnectionError::ConnectionClosed(close))
+                if u64::from(close.error_code) == 0x2
+        )
+    }
 }
 
 impl From<tokio::time::error::Elapsed> for SessionError {

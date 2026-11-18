@@ -25,6 +25,8 @@
 //!                                           when the Agent can read it)
 //!   input stream ════════════════════════►  (unidirectional, CONTROL only)
 //!   RequestKeyframe ─────────────────────►
+//!                       ◄───────────────── DesktopState (secure desktop
+//!                                           shown or gone, Windows)
 //!   -- any time --
 //!   Ping / Pong (either direction) ◄─────►
 //!   Disconnect (either direction) ───────►
@@ -75,6 +77,23 @@ pub enum DisconnectReason {
     ConsentTimeout,
     /// The Agent could not capture or encode the screen.
     MediaFailed,
+    /// The local user at the Agent stopped sharing (kill switch, tray or
+    /// window button).
+    StoppedLocally,
+    /// Too many failed or refused attempts from this device or address;
+    /// try again later.
+    RateLimited,
+}
+
+/// Which desktop the Agent's local user is looking at (blueprint v2 §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesktopState {
+    /// The normal user desktop: capture and input work.
+    Normal,
+    /// A system prompt on the secure desktop (UAC, Ctrl+Alt+Del, lock
+    /// screen) that only the local user can see and answer. Video pauses
+    /// on the last frame and remote input is suspended until `Normal`.
+    SecureDesktop,
 }
 
 /// A message on the control stream.
@@ -146,5 +165,10 @@ pub enum ControlMsg {
     VideoEncoder {
         /// Human-readable encoder name.
         name: BoundedString<MAX_ENCODER_NAME>,
+    },
+    /// The Agent's desktop changed; see [`DesktopState`].
+    DesktopState {
+        /// The new state.
+        state: DesktopState,
     },
 }

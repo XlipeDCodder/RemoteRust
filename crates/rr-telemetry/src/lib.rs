@@ -1,4 +1,5 @@
-//! Logging setup shared by every RustRemote binary (blueprint v2 §7.8, §8.10).
+//! Logging setup shared by every RustRemote binary (blueprint v2 §7.8, §8.10),
+//! and the audit log ([`audit`]).
 //!
 //! Verbosity comes from the `RUSTREMOTE_LOG` environment variable, using
 //! `tracing` filter syntax (for example `debug` or `rr_net=trace,info`).
@@ -11,6 +12,10 @@
 use std::io::IsTerminal as _;
 
 use tracing_subscriber::EnvFilter;
+
+pub mod audit;
+
+pub use audit::AuditLog;
 
 /// Environment variable holding the log filter.
 pub const LOG_ENV_VAR: &str = "RUSTREMOTE_LOG";

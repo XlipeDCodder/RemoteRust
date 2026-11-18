@@ -50,11 +50,17 @@ ring = "0.17"
 rustix = { version = "1.1", features = ["event", "fs", "mm"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
+# The audit log's JSON lines (blueprint v2 §7.8).
+serde_json = "1"
 spake2 = "0.4"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 toml = "1"
+# Agent tray icon: Shell_NotifyIcon on Windows; on Linux StatusNotifierItem
+# over D-Bus through ksni (pure Rust, no GTK). GNOME needs the AppIndicator
+# extension, on by default on Ubuntu.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Certificate parsing: the same parser rustls itself uses.
@@ -71,6 +77,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -82,7 +89,7 @@ windows = { version = "0.62", features = [
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
 # X11 screen capture (Linux): pure-Rust protocol client with the MIT-SHM,
 # DAMAGE, XFIXES and RandR extensions; no libxcb needed.
-x11rb = { version = "0.13", features = ["damage", "randr", "shm", "xfixes", "xtest"] }
+x11rb = { version = "0.13", features = ["damage", "randr", "shm", "xfixes", "xinput", "xtest"] }
 zeroize = "1"
 
 [workspace.lints.rust]

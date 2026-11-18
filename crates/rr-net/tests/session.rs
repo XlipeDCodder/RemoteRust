@@ -2,15 +2,15 @@
 //! cursor and input streams, and session end (blueprint v2 §6.5, §7.3).
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rr_net::{
-    Agent, AgentOptions, AgentSession, DeviceIdentity, Grant, RemoteEvent, SessionError,
-    SessionEvent, SessionRequest, SourceFilter, Viewer, ViewerSession,
+    Agent, AgentEvent, AgentOptions, AgentSession, DeviceIdentity, FailureKind, Grant, RemoteEvent,
+    SessionError, SessionEvent, SessionRequest, SourceFilter, Viewer, ViewerSession,
 };
 use rr_proto::{
-    AgentTimings, BoundedBytes, BoundedString, Codec, CursorMsg, DevicePublicKey, DisconnectReason,
-    InputMsg, KeyCode, MonitorInfo, MouseButton, Permissions, VideoFrameHeader,
+    AgentTimings, BoundedBytes, BoundedString, Codec, CursorMsg, DesktopState, DevicePublicKey,
+    DisconnectReason, InputMsg, KeyCode, MonitorInfo, MouseButton, Permissions, VideoFrameHeader,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -19,9 +19,11 @@ const WAIT: Duration = Duration::from_secs(10);
 
 struct Setup {
     viewer: Viewer,
+    agent: Agent,
     agent_key: DevicePublicKey,
     addr: SocketAddr,
     requests: mpsc::Receiver<SessionRequest>,
+    events: mpsc::Receiver<AgentEvent>,
     endpoint: quinn::Endpoint,
 }
 
@@ -42,6 +44,20 @@ impl Setup {
     async fn next_request(&mut self) -> SessionRequest {
         timeout(WAIT, self.requests.recv()).await.unwrap().unwrap()
     }
+
+    /// The next event the Agent reports that `pick` selects.
+    async fn event<T>(&mut self, mut pick: impl FnMut(AgentEvent) -> Option<T>) -> T {
+        timeout(WAIT, async {
+            loop {
+                let event = self.events.recv().await.expect("event feed open");
+                if let Some(found) = pick(event) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
 }
 
 /// An Agent that already knows the Viewer, with sessions routed to the test.
@@ -53,9 +69,11 @@ fn setup(consent_timeout: Duration, sessions: bool) -> Setup {
     let identity = DeviceIdentity::generate().unwrap();
     let agent_key = identity.public_key();
     let (tx, requests) = mpsc::channel(4);
+    let (events_tx, events) = mpsc::channel(64);
     let options = AgentOptions {
         sessions: sessions.then_some(tx),
         consent_timeout,
+        events: Some(events_tx),
         ..AgentOptions::new("test-agent")
     };
     let agent = Agent::new(identity, options, [viewer_key]).unwrap();
@@ -63,6 +81,7 @@ fn setup(consent_timeout: Duration, sessions: bool) -> Setup {
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn({
         let endpoint = endpoint.clone();
+        let agent = agent.clone();
         async move {
             agent
                 .serve(
@@ -74,9 +93,11 @@ fn setup(consent_timeout: Duration, sessions: bool) -> Setup {
     });
     Setup {
         viewer,
+        agent,
         agent_key,
         addr,
         requests,
+        events,
         endpoint,
     }
 }
@@ -269,7 +290,7 @@ async fn agent_ending_the_session_tells_the_viewer() {
         loop {
             match events.recv().await {
                 Some(RemoteEvent::Ended(reason)) => return reason,
-                Some(RemoteEvent::Encoder(_)) => {}
+                Some(RemoteEvent::Encoder(_) | RemoteEvent::Desktop(_)) => {}
                 None => return None,
             }
         }
@@ -403,4 +424,180 @@ async fn cursor_updates_reach_the_viewer() {
     let got = timeout(WAIT, video.recv(&mut buf)).await.unwrap().unwrap();
     assert_eq!(got, header(0, 5));
     remote.close().await;
+}
+
+/// How the Viewer's session ended, as its events report it.
+async fn ending(events: &mut mpsc::Receiver<RemoteEvent>) -> Option<DisconnectReason> {
+    timeout(WAIT, async {
+        loop {
+            match events.recv().await {
+                Some(RemoteEvent::Ended(reason)) => return reason,
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn kill_switch_ends_the_session_within_200_ms() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    let (mut remote, mut agent) = accepted(&mut setup, control()).await;
+    let mut events = remote.take_events().unwrap();
+    let started = Instant::now();
+    setup.agent.end_all(DisconnectReason::StoppedLocally);
+    assert_eq!(
+        ending(&mut events).await,
+        Some(DisconnectReason::StoppedLocally)
+    );
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
+    // The media side sees the session end too.
+    assert_eq!(timeout(WAIT, agent.next_event()).await.unwrap(), None);
+    let reason = setup
+        .event(|event| match event {
+            AgentEvent::Disconnected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .await;
+    assert_eq!(reason, Some(DisconnectReason::StoppedLocally));
+}
+
+#[tokio::test]
+async fn kill_switch_withdraws_a_pending_request() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    let session = setup.connect().await;
+    let viewer = tokio::spawn(session.start(Permissions::VIEW));
+    let mut request = setup.next_request().await;
+    setup.agent.end_all(DisconnectReason::StoppedLocally);
+    timeout(WAIT, request.withdrawn()).await.unwrap();
+    let err = timeout(WAIT, viewer).await.unwrap().unwrap().unwrap_err();
+    assert!(
+        matches!(err, SessionError::Closed(DisconnectReason::StoppedLocally)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn kill_switch_does_not_affect_later_sessions() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    setup.agent.end_all(DisconnectReason::StoppedLocally);
+    let (mut remote, agent) = accepted(&mut setup, Permissions::VIEW).await;
+    let mut events = remote.take_events().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!agent.handle().is_closed());
+    agent.handle().end(DisconnectReason::Normal);
+    assert_eq!(ending(&mut events).await, Some(DisconnectReason::Normal));
+}
+
+/// The next desktop state the Viewer's events report.
+async fn next_desktop_state(events: &mut mpsc::Receiver<RemoteEvent>) -> DesktopState {
+    timeout(WAIT, async {
+        loop {
+            match events.recv().await {
+                Some(RemoteEvent::Desktop(state)) => return state,
+                Some(_) => {}
+                None => panic!("session ended"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn desktop_state_reaches_the_viewer() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    let (mut remote, agent) = accepted(&mut setup, control()).await;
+    let mut events = remote.take_events().unwrap();
+    agent
+        .handle()
+        .set_desktop_state(DesktopState::SecureDesktop);
+    assert_eq!(
+        next_desktop_state(&mut events).await,
+        DesktopState::SecureDesktop
+    );
+    agent.handle().set_desktop_state(DesktopState::Normal);
+    assert_eq!(next_desktop_state(&mut events).await, DesktopState::Normal);
+}
+
+/// The reason of the next `SessionRefused` event.
+async fn next_refusal(setup: &mut Setup) -> DisconnectReason {
+    setup
+        .event(|event| match event {
+            AgentEvent::SessionRefused { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .await
+}
+
+#[tokio::test]
+async fn refused_device_must_wait_before_asking_again() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    let session = setup.connect().await;
+    let viewer = tokio::spawn(session.start(Permissions::VIEW));
+    setup.next_request().await.deny();
+    let err = timeout(WAIT, viewer).await.unwrap().unwrap().unwrap_err();
+    assert!(matches!(
+        err,
+        SessionError::Closed(DisconnectReason::ConsentDenied)
+    ));
+
+    // Asking again at once: refused without bothering the local user.
+    let session = setup.connect().await;
+    let err = session.start(Permissions::VIEW).await.unwrap_err();
+    assert!(
+        matches!(err, SessionError::Closed(DisconnectReason::RateLimited)),
+        "{err:?}"
+    );
+    assert!(setup.requests.try_recv().is_err());
+    assert_eq!(
+        next_refusal(&mut setup).await,
+        DisconnectReason::ConsentDenied
+    );
+    assert_eq!(
+        next_refusal(&mut setup).await,
+        DisconnectReason::RateLimited
+    );
+
+    // After the backoff (1 s for a first refusal), the device may ask.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let session = setup.connect().await;
+    let viewer = tokio::spawn(session.start(Permissions::VIEW));
+    let request = setup.next_request().await;
+    let agent = request.accept(grant(Permissions::VIEW)).await.unwrap();
+    timeout(WAIT, viewer).await.unwrap().unwrap().unwrap();
+    agent.handle().end(DisconnectReason::Normal);
+}
+
+#[tokio::test]
+async fn failed_handshake_blocks_the_address_for_a_while() {
+    let mut setup = setup(Duration::from_secs(30), true);
+    // An unknown device: rejected during TLS (pairing is off).
+    let stranger = Viewer::new(DeviceIdentity::generate().unwrap(), "stranger");
+    assert!(stranger.connect(setup.addr, setup.agent_key).await.is_err());
+    let (kind, blocked_for) = setup
+        .event(|event| match event {
+            AgentEvent::AuthFailed {
+                kind, blocked_for, ..
+            } => Some((kind, blocked_for)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(kind, FailureKind::Handshake);
+    assert_eq!(blocked_for, Duration::from_secs(1));
+
+    // The same address is refused at once, even with a paired key...
+    let refused = setup.viewer.connect(setup.addr, setup.agent_key).await;
+    assert!(refused.is_err());
+    setup
+        .event(|event| matches!(event, AgentEvent::Blocked { .. }).then_some(()))
+        .await;
+
+    // ...until the block ends.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let session = setup.connect().await;
+    session.close().await;
 }
