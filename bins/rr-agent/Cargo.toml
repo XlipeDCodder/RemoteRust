@@ -23,9 +23,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tray-icon.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tray-icon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+serde.workspace = true
+zbus.workspace = true
 
 [lints]
 workspace = true

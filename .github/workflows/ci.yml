@@ -23,12 +23,12 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       # Wayland capture links libpipewire (bindgen needs libclang); Xvfb
-      # runs the X11 capture tests.
+      # runs the X11 capture tests; dbus-run-session the tray test.
       - name: Install Linux build and test packages
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config xvfb
+          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config xvfb dbus-daemon
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -42,6 +42,9 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24"
           cargo test -p rr-platform --locked -- --ignored --test-threads=1
           --skip lists_monitors_and_captures_each
+      - name: Tray (StatusNotifierItem) on a private session bus
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- cargo test -p rr-agent --locked -- --ignored tray
 
   deny:
     name: cargo-deny

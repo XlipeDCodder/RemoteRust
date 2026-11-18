@@ -191,6 +191,11 @@ impl Hub {
         self.quit.load(Ordering::SeqCst)
     }
 
+    /// The network side's runtime.
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
+    }
+
     /// The shared state. Hold the guard briefly.
     pub fn state(&self) -> MutexGuard<'_, State> {
         // Every update is a few plain assignments: poisoning cannot leave

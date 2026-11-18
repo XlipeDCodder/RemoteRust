@@ -17,8 +17,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use tray_icon::menu::{MenuEvent, MenuId};
-use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::WindowEvent;
@@ -27,7 +25,7 @@ use winit::window::{UserAttentionType, Window, WindowButtons, WindowId, WindowLe
 
 use self::consent::{Choice, Dialog};
 use self::gpu::{Graphics, Painter};
-use self::tray::{Tray, TrayAction};
+use self::tray::{OnAction, Tray, TrayAction};
 use self::window::Action;
 use crate::hub::{Hub, Via};
 
@@ -39,10 +37,8 @@ const TICK: Duration = Duration::from_secs(1);
 pub enum UiEvent {
     /// The hub changed.
     Wake,
-    /// A tray menu item was clicked.
-    Menu(MenuId),
-    /// The tray icon was clicked.
-    TrayClicked,
+    /// Something was picked in the tray.
+    Tray(TrayAction),
 }
 
 /// Connects to the window system; fails without a graphical session.
@@ -68,23 +64,8 @@ pub fn run(event_loop: EventLoop<UiEvent>, hub: Arc<Hub>) -> anyhow::Result<()> 
     let proxy = event_loop.create_proxy();
     let wake = Mutex::new(proxy.clone());
     hub.set_waker(move || send(&wake, UiEvent::Wake));
-    let menu = Mutex::new(proxy.clone());
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        send(&menu, UiEvent::Menu(event.id));
-    }));
-    let clicks = Mutex::new(proxy);
-    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-        if matches!(
-            event,
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } | TrayIconEvent::DoubleClick { .. }
-        ) {
-            send(&clicks, UiEvent::TrayClicked);
-        }
-    }));
+    let tray_events = Mutex::new(proxy);
+    let on_tray: OnAction = Arc::new(move |action| send(&tray_events, UiEvent::Tray(action)));
 
     let mut app = App {
         hub,
@@ -93,6 +74,7 @@ pub fn run(event_loop: EventLoop<UiEvent>, hub: Arc<Hub>) -> anyhow::Result<()> 
         hidden: false,
         consent: None,
         tray: None,
+        on_tray,
         next_tick: Instant::now(),
         failure: None,
     };
@@ -113,6 +95,8 @@ struct App {
     hidden: bool,
     consent: Option<(Painter, Dialog)>,
     tray: Option<Tray>,
+    /// Where the tray's actions go (to this loop).
+    on_tray: OnAction,
     next_tick: Instant,
     failure: Option<anyhow::Error>,
 }
@@ -228,11 +212,13 @@ impl App {
         }
     }
 
-    /// The close button hides the window to the tray (Windows) or
-    /// minimizes it: quitting is in the window and the tray menu.
+    /// The close button hides the window to the tray, or minimizes it when
+    /// no tray shows the icon (or the window system cannot hide windows,
+    /// like Wayland): quitting is in the window and the tray menu.
     fn hide_main(&mut self) {
         if let Some(main) = &self.main {
-            if cfg!(windows) && self.tray.is_some() {
+            let to_tray = self.tray.as_ref().is_some_and(Tray::shown);
+            if to_tray && main.window().is_visible().is_some() {
                 main.window().set_visible(false);
             } else {
                 main.window().set_minimized(true);
@@ -310,7 +296,7 @@ impl ApplicationHandler<UiEvent> for App {
         }
         // On Windows the tray icon needs this thread's message loop, which
         // is running now.
-        match Tray::new() {
+        match Tray::new(self.hub.runtime(), Arc::clone(&self.on_tray)) {
             Ok(tray) => self.tray = Some(tray),
             Err(err) => {
                 tracing::warn!(error = format!("{err:#}"), "no tray icon");
@@ -322,13 +308,9 @@ impl ApplicationHandler<UiEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UiEvent) {
         match event {
             UiEvent::Wake => self.sync(event_loop),
-            UiEvent::Menu(id) => match self.tray.as_ref().and_then(|tray| tray.action(&id)) {
-                Some(TrayAction::Open) => self.show_main(),
-                Some(TrayAction::Stop) => self.hub.kill(Via::Tray),
-                Some(TrayAction::Quit) => event_loop.exit(),
-                None => {}
-            },
-            UiEvent::TrayClicked => self.show_main(),
+            UiEvent::Tray(TrayAction::Open) => self.show_main(),
+            UiEvent::Tray(TrayAction::Stop) => self.hub.kill(Via::Tray),
+            UiEvent::Tray(TrayAction::Quit) => event_loop.exit(),
         }
     }
 

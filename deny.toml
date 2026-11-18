@@ -31,8 +31,6 @@ exceptions = [
     # egui's built-in fonts (Hack, Ubuntu, Noto Emoji): font data bundled
     # with the Viewer; both licenses allow that. Nothing else may use them.
     { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
-    # The Linux tray (StatusNotifierItem): public-domain dedication.
-    { crate = "ksni", allow = ["Unlicense"] },
 ]
 
 [licenses.private]
